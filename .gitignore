@@ -1,0 +1,57 @@
+# ===== 运行时数据 / 账号凭证：禁止提交 =====
+# 抖音自动化浏览器登录态（含 cookies / localStorage，等同账号凭证）
+.data/
+# 本地日志与数据库转储
+.bak/
+*.log
+# 后端 Chrome CDP 运行时缓存（含 cookie 类数据）
+backend/.runtime/
+
+# Python 构建产物
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# 前端依赖（本项目无构建，但留作防御）
+node_modules/
+
+# 工作台项目记忆（含用户隐私 / 项目笔记，禁止提交）
+.workbuddy/
+
+# 各 AI 编码代理的本地缓存 / 评估产物（非项目源码）
+.agents/
+.claude/
+.codex/
+.augment/
+.cursor/
+.kodu/
+.windsurf/
+
+# Playwright / 浏览器巡检截图与录制（临时产物）
+.playwright-cli/
+.playwright/
+.pyppeteer/
+screenshots/
+
+# 临时 / 一次性脚本
+_chk.py
+_chk_*.py
+_fix_*.py
+tmp_*.py
+scratch/
+
+# 临时截图（bug 截图等，非产品素材）
+screenshot_*.png
+*.screenshot.png
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Accidental system directory
+%SystemDrive%/

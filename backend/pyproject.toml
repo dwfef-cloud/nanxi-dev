@@ -1,0 +1,27 @@
+[project]
+name = "douyin-lead-system"
+version = "0.1.0"
+description = "Douyin lead discovery and private-message assistant"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+]
+
+# 开发/测试依赖：pip install -e ".[dev]"
+# 主 dependencies 保持不动，避免影响生产部署
+[project.optional-dependencies]
+dev = [
+  # 测试：TestClient 依赖 httpx，缺它会导致 17/19 个测试文件收集期报错
+  "pytest",
+  "httpx",
+  # services/export_service.py 使用
+  "openpyxl",
+  # services/monitor_service.py 使用
+  "psutil",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

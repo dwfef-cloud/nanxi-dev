@@ -13,7 +13,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 # P2-8: allowed AI providers; invalid value must fail validation with 422
-AIProvider = Literal["doubao", "dashscope"]
+# openai = OpenAI 兼容网关（sailapi / 任意兼容 /v1/chat/completions 的服务）
+AIProvider = Literal["doubao", "dashscope", "openai"]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -22,10 +23,11 @@ AIProvider = Literal["doubao", "dashscope"]
 
 class AISettings(BaseModel):
     """AI 大模型配置"""
-    provider: AIProvider = Field(default="doubao", description="提供商：doubao / dashscope")
+    provider: AIProvider = Field(default="doubao", description="提供商：doubao / dashscope / openai")
     api_key: str = Field(default="", description="API Key（读取时已脱敏）")
     masked_key: str = Field(default="", description="脱敏后的 API Key")
     model: str = Field(default="", description="模型名称/Endpoint ID")
+    base_url: str = Field(default="", description="OpenAI 兼容基地址（仅 openai provider 使用，需含 /v1）")
     temperature: float = Field(default=0.7, ge=0, le=2, description="采样温度 0-2")
     timeout: int = Field(default=30, ge=1, le=120, description="请求超时（秒）")
 
@@ -35,6 +37,7 @@ class AISettingsUpdate(BaseModel):
     provider: AIProvider | None = None
     api_key: str | None = None
     model: str | None = None
+    base_url: str | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     timeout: int | None = Field(default=None, ge=1, le=120)
 
@@ -135,6 +138,7 @@ class TestAIRequest(BaseModel):
     provider: str = Field(default="doubao", description="提供商")
     api_key: str = Field(default="", description="API Key")
     model: str = Field(default="", description="模型名称")
+    base_url: str = Field(default="", description="OpenAI 兼容基地址（openai provider 使用）")
     timeout: int = Field(default=10, ge=1, le=120, description="超时（秒）")
 
 

@@ -4,7 +4,7 @@
 - 双 Provider 通过环境变量 AI_PROVIDER 切换（dashscope | doubao）
 - API Key 分别从 DASHSCOPE_API_KEY / DOUBAO_API_KEY 读取
 - 未配置 Key 时所有生成接口返回 503 + 明确提示，不崩溃
-- 使用标准库 urllib.request（无额外依赖），统一 10s 超时
+- 使用标准库 urllib.request（无额外依赖），调用超时见 DEFAULT_TIMEOUT（默认 120s，可由配置中心覆盖）
 - 所有 LLM 调用走 _call_llm 统一入口，异常归一化为 HTTPException
 """
 from __future__ import annotations
@@ -40,10 +40,18 @@ logger = logging.getLogger(__name__)
 # ── 常量 ──────────────────────────────────────────────────────
 DASHSCOPE_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
 DOUBAO_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-DEFAULT_TIMEOUT = 10  # 秒
+# OpenAI 兼容网关默认基地址（可被环境变量 OPENAI_BASE_URL / 配置中心的 base_url 覆盖）
+OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
+DEFAULT_TIMEOUT = 120  # 秒。实测当前中转站：小提示词 11~16s、5 类话术生成 25~60s，
+# 原来的 10s 会让 analyze_lead / 智能草稿 / 评论回复建议 / 评论语义分级 **100% 失败**（日志里的
+# 「评论语义分级失败…The read operation timed out」即由此而来）。留 2x 余量。
+
+# 外呼统一绕过本机 HTTP 代理（环境存在 HTTP_PROXY=127.0.0.1:58779 会让外网请求失败）
+_OPENER = request.build_opener(request.ProxyHandler({}))
 
 SCRIPT_CATEGORY_LABELS = {
     "comment": "评论区回复",
+    "welcome": "欢迎语/首句筛选",
     "private_message": "私信",
     "wechat_guide": "微信引导",
     "objection": "异议处理",
@@ -118,12 +126,16 @@ class AIService:
     def __init__(self) -> None:
         # 环境变量作为默认值/兜底
         self._provider = os.getenv("AI_PROVIDER", "dashscope").lower().strip()
-        if self._provider not in ("dashscope", "doubao"):
+        if self._provider not in ("dashscope", "doubao", "openai"):
             self._provider = "dashscope"
         self._dashscope_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
         self._doubao_key = os.getenv("DOUBAO_API_KEY", "").strip()
+        self._openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self._model = os.getenv("DASHSCOPE_MODEL", "qwen-plus").strip() or "qwen-plus"
         self._doubao_model = os.getenv("DOUBAO_MODEL", "").strip()
+        self._openai_model = os.getenv("OPENAI_MODEL", "").strip()
+        # OpenAI 兼容基地址：环境变量 OPENAI_BASE_URL > 默认值
+        self._base_url = os.getenv("OPENAI_BASE_URL", OPENAI_DEFAULT_BASE).strip().rstrip("/")
         # 可配置参数（settings_service 热更新覆盖）
         self._temperature = 0.7
         self._timeout = DEFAULT_TIMEOUT
@@ -153,23 +165,30 @@ class AIService:
         if self._settings_service is None:
             return
         try:
-            ai_cfg = self._settings_service.get_ai_settings()
+            # 必须用未脱敏的原始配置，否则 api_key 会被掩码成 sk-**** 导致鉴权失败
+            ai_cfg = self._settings_service.get_ai_settings_raw()
         except Exception:
             # 读取失败不影响现有运行
             return
-        if ai_cfg.provider and ai_cfg.provider in ("dashscope", "doubao"):
+        if ai_cfg.provider and ai_cfg.provider in ("dashscope", "doubao", "openai"):
             self._provider = ai_cfg.provider
         # API Key：仅在配置中心有值时覆盖（空值保留环境变量兜底）
         if ai_cfg.api_key:
             if self._provider == "doubao":
                 self._doubao_key = ai_cfg.api_key
+            elif self._provider == "openai":
+                self._openai_key = ai_cfg.api_key
             else:
                 self._dashscope_key = ai_cfg.api_key
         if ai_cfg.model:
             if self._provider == "doubao":
                 self._doubao_model = ai_cfg.model
+            elif self._provider == "openai":
+                self._openai_model = ai_cfg.model
             else:
                 self._model = ai_cfg.model
+        if ai_cfg.base_url:
+            self._base_url = ai_cfg.base_url.strip().rstrip("/")
         if ai_cfg.temperature is not None:
             self._temperature = ai_cfg.temperature
         if ai_cfg.timeout is not None:
@@ -186,6 +205,7 @@ class AIService:
             configured=bool(key),
             masked_key=masked,
             model=self._active_model(),
+            base_url=self._base_url,
         )
 
     def update_settings(self, payload: AISettingsUpdate) -> AISettingsRead:
@@ -199,31 +219,85 @@ class AIService:
                 update_kwargs["api_key"] = payload.api_key.strip()
             if payload.model and payload.model.strip():
                 update_kwargs["model"] = payload.model.strip()
+            if payload.base_url and payload.base_url.strip():
+                update_kwargs["base_url"] = payload.base_url.strip()
             if update_kwargs:
                 self._settings_service.update_ai_settings(_SettingsAIUpdate(**update_kwargs))
         else:
-            if payload.provider in {"dashscope", "doubao"}:
+            if payload.provider in {"dashscope", "doubao", "openai"}:
                 self._provider = payload.provider
-            if payload.api_key.strip():
+            if payload.api_key and payload.api_key.strip():
                 if self._provider == "doubao":
                     self._doubao_key = payload.api_key.strip()
+                elif self._provider == "openai":
+                    self._openai_key = payload.api_key.strip()
                 else:
                     self._dashscope_key = payload.api_key.strip()
-            if payload.model.strip():
+            if payload.model and payload.model.strip():
                 if self._provider == "doubao":
                     self._doubao_model = payload.model.strip()
+                elif self._provider == "openai":
+                    self._openai_model = payload.model.strip()
                 else:
                     self._model = payload.model.strip()
+            if payload.base_url and payload.base_url.strip():
+                self._base_url = payload.base_url.strip().rstrip("/")
         return self.get_settings()
 
     # ── 内部工具 ──────────────────────────────────────────────
     def _active_key(self) -> str:
-        return self._doubao_key if self._provider == "doubao" else self._dashscope_key
+        if self._provider == "doubao":
+            return self._doubao_key
+        if self._provider == "openai":
+            return self._openai_key
+        return self._dashscope_key
 
     def _active_model(self) -> str:
         if self._provider == "doubao":
             return self._doubao_model or "ep-20240101-default"
+        if self._provider == "openai":
+            return self._openai_model
         return self._model
+
+    def _openai_endpoint(self, path: str) -> str:
+        """拼接 OpenAI 兼容端点：base_url 已含 /v1，直接追 path。"""
+        base = self._base_url.rstrip("/")
+        return base + "/" + path.lstrip("/")
+
+    def fetch_models(self) -> list[str]:
+        """拉取当前 OpenAI 兼容 provider 的可用模型列表（GET {base_url}/models）。
+
+        仅 openai provider 支持；未配置 Key 时抛 503；网络/格式异常抛 502。
+        返回模型 id 列表，供前端下拉选择，实现「大量接入其他模型」。
+        """
+        if self._provider != "openai":
+            raise HTTPException(status_code=400, detail="仅 OpenAI 兼容 provider 支持拉取模型列表")
+        self._ensure_configured()
+        api_key = self._active_key()
+        url = self._openai_endpoint("models")
+        req = request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with _OPENER.open(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300] if exc.fp else str(exc)
+            raise HTTPException(status_code=502, detail=f"拉取模型列表上游错误（HTTP {exc.code}）：{detail}") from exc
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"拉取模型列表失败（网络/超时）：{exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="拉取模型列表返回内容不是合法 JSON") from exc
+
+        data = result.get("data", []) if isinstance(result, dict) else []
+        models = [str(m["id"]) for m in data if isinstance(m, dict) and m.get("id")]
+        return models
 
     def _ensure_configured(self) -> None:
         """未配置 Key 时抛出 503，所有生成接口统一调用"""
@@ -260,6 +334,17 @@ class AIService:
                 "temperature": self._temperature,
             }
             endpoint = DOUBAO_ENDPOINT
+        elif self._provider == "openai":
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            body = {
+                "model": self._active_model(),
+                "messages": messages,
+                "temperature": self._temperature,
+            }
+            endpoint = self._openai_endpoint("chat/completions")
         else:
             messages = []
             if system:
@@ -282,7 +367,7 @@ class AIService:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=effective_timeout) as resp:
+            with _OPENER.open(req, timeout=effective_timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 result = json.loads(raw)
         except error.HTTPError as exc:
@@ -294,7 +379,7 @@ class AIService:
             raise HTTPException(status_code=502, detail="AI 服务返回内容不是合法 JSON") from exc
 
         try:
-            if self._provider == "doubao":
+            if self._provider in ("doubao", "openai"):
                 content = result["choices"][0]["message"]["content"]
             else:
                 content = result["output"]["choices"][0]["message"]["content"]
@@ -340,7 +425,7 @@ class AIService:
 目标客户：{payload.target_customer}
 产品卖点：{payload.selling_points}
 只返回 JSON，不要 Markdown，字段必须是 needs、pain_points、search_keywords、intent_keywords、excluded_keywords、customer_language；每个字段都是 3-8 条简短中文字符串。"""
-        content = self._call_llm(prompt, system="你是获客策略专家。", timeout=45)
+        content = self._call_llm(prompt, system="你是获客策略专家。", timeout=DEFAULT_TIMEOUT)
         try:
             parsed = self._extract_json(content)
             return ProfileAnalysisResponse(**parsed)
@@ -380,7 +465,7 @@ class AIService:
 1. 意向等级 intent_level：A=高意向（明确询价/求推荐/主动私信），B=中意向（表达兴趣/提问相关），C=低意向（泛泛评论/无明确需求）
 2. customer_need：一句话总结客户核心需求（不超过30字）
 3. tags：3-6个需求标签（简短中文，如"老房翻新""预算敏感""求报价"）
-4. recommended_script_category：推荐话术类别，只能是 comment / private_message / wechat_guide / objection / nurture 之一
+4. recommended_script_category：推荐话术类别，只能是 comment / welcome / private_message / wechat_guide / objection / nurture 之一
 5. follow_up_suggestion：一句话可执行的跟进建议（不超过40字）
 6. raw_reasoning：简要说明判断依据（不超过50字）
 
@@ -396,7 +481,7 @@ class AIService:
             if intent not in ("A", "B", "C"):
                 intent = "C"
             cat = parsed.get("recommended_script_category", "private_message")
-            if cat not in ("comment", "private_message", "wechat_guide", "objection", "nurture"):
+            if cat not in ("comment", "welcome", "private_message", "wechat_guide", "objection", "nurture"):
                 cat = "private_message"
             tags = parsed.get("tags", [])
             if not isinstance(tags, list):

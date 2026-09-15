@@ -42,38 +42,49 @@
     }
   }
 
-  /* ── 统一 apiFetch：10秒超时 / HTTP错误 / 网络错误 ── */
+  /* ── 统一 apiFetch：10秒超时 / HTTP错误 / 网络错误 ──
+     · GET（无 body）不带 Content-Type，避免触发多余的 CORS 预检
+     · 网络层瞬时失败（TypeError）对 GET 自动重试 2 次，规避本地回环偶发断连 */
   async function apiFetch(path, options = {}) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-    _showLoading();
-    try {
-      const res = await fetch(API_BASE + path, {
-        ...options,
-        signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
-        let detail = '';
-        try { const j = await res.json(); detail = j.detail || ''; } catch (e) { /* ignore */ }
-        const err = new Error('HTTP ' + res.status + (detail ? '：' + detail : ''));
-        err.status = res.status;
+    // options.timeout 覆盖默认超时：AI 生成/优化是长任务（实测 25s+），
+    // 写死 10s 会在 AI 返回前 abort，表现为「一直不生成」。
+    const { timeout = FETCH_TIMEOUT, ...init } = options;
+    const method = (init.method || 'GET').toUpperCase();
+    const canRetry = method === 'GET';
+    for (let attempt = 0; ; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      const headers = { ...(init.headers || {}) };
+      if (init.body != null && headers['Content-Type'] == null) headers['Content-Type'] = 'application/json';
+      _showLoading();
+      try {
+        const res = await fetch(API_BASE + path, { ...init, signal: controller.signal, headers });
+        clearTimeout(timeoutId);
+        if (!res.ok) {
+          let detail = '';
+          try { const j = await res.json(); detail = j.detail || ''; } catch (e) { /* ignore */ }
+          const err = new Error('HTTP ' + res.status + (detail ? '：' + detail : ''));
+          err.status = res.status;
+          throw err;
+        }
+        if (res.status === 204) return null;
+        return await res.json();
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('请求超时，请检查后端服务是否启动');
+        }
+        if (err instanceof TypeError) {
+          if (canRetry && attempt < 2) {
+            await new Promise((r) => setTimeout(r, 180 * (attempt + 1)));
+            continue;
+          }
+          throw new Error('网络错误，请检查后端服务是否启动（' + err.message + '）');
+        }
         throw err;
+      } finally {
+        _hideLoading();
       }
-      if (res.status === 204) return null;
-      return res.json();
-    } catch (err) {
-      clearTimeout(timeoutId);
-      if (err.name === 'AbortError') {
-        throw new Error('请求超时，请检查后端服务是否启动');
-      }
-      if (err instanceof TypeError) {
-        throw new Error('网络错误，请检查后端服务是否启动（' + err.message + '）');
-      }
-      throw err;
-    } finally {
-      _hideLoading();
     }
   }
 
@@ -135,6 +146,99 @@
     return _normalize(data);
   }
 
+  /**
+   * 新建话术（真实落库）
+   * POST /api/scripts
+   * @param {{name:string, category:string, intro?:string}} payload
+   * @returns {Promise<Object>} 新建的话术（含 id）
+   */
+  async function createScript(payload) {
+    const data = await apiFetch('/scripts', { method: 'POST', body: JSON.stringify(payload) });
+    return _normalize(data);
+  }
+
+  /**
+   * 更新话术（改名 / 改分类 / 启用禁用）
+   * PATCH /api/scripts/{id}
+   */
+  async function updateScript(id, payload) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify(payload) });
+    return _normalize(data);
+  }
+
+  /**
+   * 新增话术变体（A/B 用）
+   * POST /api/scripts/{id}/variants
+   * @param {{text:string, weight?:number, variantId?:string}} payload
+   */
+  async function addScriptVariant(id, payload) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id) + '/variants', { method: 'POST', body: JSON.stringify(payload) });
+    return _normalize(data);
+  }
+
+  /**
+   * 更新话术变体（文本 / 权重 / 状态）
+   * PATCH /api/scripts/{id}/variants/{variantId}
+   */
+  async function updateScriptVariant(id, variantId, payload) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id) + '/variants/' + encodeURIComponent(variantId),
+      { method: 'PATCH', body: JSON.stringify(payload) });
+    return _normalize(data);
+  }
+
+  /**
+   * 删除话术变体（A/B/C）
+   * DELETE /api/scripts/{id}/variants/{variantId}
+   */
+  async function deleteScriptVariant(id, variantId) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id) + '/variants/' + encodeURIComponent(variantId),
+      { method: 'DELETE' });
+    return _normalize(data);
+  }
+
+  /**
+   * 删除整条话术（连带其全部变体；历史归因记录保留）
+   * DELETE /api/scripts/{id}
+   */
+  async function deleteScript(id) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id), { method: 'DELETE' });
+    return _normalize(data);
+  }
+
+  /**
+   * 按业务画像 AI 生成全部分类话术（落库，source='generated'）
+   * POST /api/scripts/generate  · AI 较慢，超时 120s
+   */
+  async function generateScriptByProfile() {
+    const data = await apiFetch('/scripts/generate', { method: 'POST', timeout: 120000 });
+    return _normalize(data);
+  }
+
+  /**
+   * 仅 AI 计算新话术（不写库），用于 P2 刷新差异预览
+   * POST /api/scripts/generate-preview
+   */
+  async function generateScriptPreview() {
+    const data = await apiFetch('/scripts/generate-preview', { method: 'POST', timeout: 120000 });
+    return _normalize(data);
+  }
+
+  /**
+   * 单条话术的 AI 优化 / 扩写：只把用户勾选的那几个画像变量喂给 AI。
+   * 只算不写库，返回草稿供勾选编辑后再落库。
+   * POST /api/scripts/{id}/optimize
+   * @param {string} id 话术 ID
+   * @param {{variables:string[], mode:'optimize'|'new', count?:number,
+   *          variants:Array<{variantId:string,text:string}>}} payload
+   * @returns {Promise<{ok:boolean,mode:string,drafts:Array,missing:string[],usedVars:string[]}>}
+   */
+  async function optimizeScript(id, payload) {
+    const data = await apiFetch('/scripts/' + encodeURIComponent(id) + '/optimize', {
+      method: 'POST', timeout: 120000, body: JSON.stringify(payload),
+    });
+    return _normalize(data);
+  }
+
   /* ════════ 获客域 · 抖音账号 ════════ */
 
   /**
@@ -145,6 +249,41 @@
   async function getAccounts() {
     const data = await apiFetch('/accounts');
     return _normalize(data);
+  }
+
+  /**
+   * 登录后把已登录的抖音号同步进账号列表（幂等 upsert）
+   * POST /api/accounts/sync-douyin
+   * @returns {Promise<Object>} 同步后的账号对象
+   */
+  async function syncDouyinAccount() {
+    const res = await apiFetch('/accounts/sync-douyin', { method: 'POST' });
+    return _normalize(res);
+  }
+
+  /**
+   * 当前激活的抖音账号（多账号登录态隔离）
+   * GET /api/accounts/active
+   * @returns {Promise<Object>} { accountId, nickname, profileDir, loggedIn }
+   */
+  async function getActiveAccount() {
+    const res = await apiFetch('/accounts/active');
+    return _normalize(res);
+  }
+
+  /**
+   * 切换当前使用的抖音账号：之后采集 / 评论都用该账号那份登录态。
+   * 目标账号目录为空时后端会自动继承现有登录态，不必重新扫码。
+   * POST /api/accounts/{id}/activate
+   * @param {string} accountId - 账号 id
+   * @returns {Promise<Object>} { accountId, nickname, profileDir, loggedIn, inherited }
+   */
+  async function activateAccount(accountId) {
+    const res = await apiFetch(
+      `/accounts/${encodeURIComponent(accountId)}/activate`,
+      { method: 'POST' }
+    );
+    return _normalize(res);
   }
 
   /* ════════ 客户域 · 客户与商机 ════════ */
@@ -215,14 +354,19 @@
   }
 
   /**
-   * 标记流失
+   * 标记流失（结构化：分类 + 说明）
    * POST /api/customers/{id}/lost
    * @param {string} cuId - 客户 ID
-   * @param {string} reason - 流失原因
+   * @param {string} category - 流失原因分类：price/competitor/no_need/timing/contact_lost/other
+   * @param {string} [note] - 流失原因说明（展示用）
    * @returns {Promise<Object>} { ok: true }
    */
-  async function markLost(cuId, reason) {
-    const body = JSON.stringify({ reason });
+  async function markLost(cuId, category, note) {
+    // 兼容旧调用 markLost(id, reason)：只传一个参数时，把它当自由文本备注（后端归入 other）
+    const payload = (note === undefined || note === null || note === '')
+      ? { reason: category }
+      : { category, note };
+    const body = JSON.stringify(payload);
     const res = await apiFetch('/customers/' + encodeURIComponent(cuId) + '/lost', { method: 'POST', body });
     return _normalize(res);
   }
@@ -285,7 +429,7 @@
    */
   async function aiAnalyzeLead(payload) {
     const body = JSON.stringify(payload || {});
-    return await apiFetch('/ai/analyze', { method: 'POST', body });
+    return await apiFetch('/ai/analyze', { method: 'POST', body, timeout: 120000 }); // AI 慢，放宽
   }
 
   /**
@@ -295,7 +439,7 @@
    */
   async function aiSmartDraft(payload) {
     const body = JSON.stringify(payload || {});
-    return await apiFetch('/ai/draft', { method: 'POST', body });
+    return await apiFetch('/ai/draft', { method: 'POST', body, timeout: 120000 }); // AI 慢，放宽
   }
 
   /**
@@ -304,7 +448,7 @@
    */
   async function aiCommentSuggestion(payload) {
     const body = JSON.stringify(payload || {});
-    return await apiFetch('/ai/comment-suggestion', { method: 'POST', body });
+    return await apiFetch('/ai/comment-suggestion', { method: 'POST', body, timeout: 120000 }); // AI 慢，放宽
   }
 
   /* ══════════ P3-12: 侧边栏角标汇总 ══════════ */
@@ -322,14 +466,44 @@
     }
   }
 
+  /* ══════════ 删除操作 ══════════ */
+
+  /**
+   * 删除一条线索（评论候选池用）
+   * DELETE /api/leads/{lead_id}
+   */
+  async function deleteLead(leadId) {
+    return apiFetch('/leads/' + encodeURIComponent(leadId), { method: 'DELETE' });
+  }
+
+  /**
+   * 删除一条评论回复任务（待办互动用）
+   * DELETE /api/comments/tasks/{task_id}
+   */
+  async function deleteCommentTask(taskId) {
+    return apiFetch('/comments/tasks/' + encodeURIComponent(taskId), { method: 'DELETE' });
+  }
+
   /* ── 挂载到全局 window.MOCK_API（覆盖 mock 回退版本） ── */
   window.MOCK_API = window.MOCK_API || {};
   Object.assign(window.MOCK_API, {
     /* 获客域 · 话术库 */
     getScripts,
     getScriptTemplates,
+    createScript,
+    updateScript,
+    addScriptVariant,
+    updateScriptVariant,
+    deleteScript,
+    deleteScriptVariant,
+    generateScriptByProfile,
+    generateScriptPreview,
+    optimizeScript,
     /* 获客域 · 抖音账号 */
     getAccounts,
+    syncDouyinAccount,
+    getActiveAccount,
+    activateAccount,
     /* 客户域 · 客户与商机 */
     getCustomers,
     getStageMeta,
@@ -348,5 +522,8 @@
     aiCommentSuggestion,
     /* P3-12: 角标 */
     getNavBadges,
+    /* 删除操作 */
+    deleteLead,
+    deleteCommentTask,
   });
 })();

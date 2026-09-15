@@ -41,7 +41,17 @@ _chk.py
 _chk_*.py
 _fix_*.py
 tmp_*.py
+_port.py
+_port.txt
+_probe.txt
 scratch/
+
+# 备份文件
+*.bak
+*.bak.*
+
+# 前端预览草稿
+_preview-*.html
 
 # 临时截图（bug 截图等，非产品素材）
 screenshot_*.png

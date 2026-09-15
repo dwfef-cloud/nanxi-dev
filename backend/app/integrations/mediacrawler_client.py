@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
+
+# 本机 HTTP_PROXY 会让访问 127.0.0.1 的请求被代理拦截（表现为挂起或 502），
+# 因此所有对本地 MediaCrawler 的请求都必须显式绕过代理。
+_OPENER = build_opener(ProxyHandler({}))
 
 
 DEFAULT_ROOT = Path(r"D:\24\MediaCrawler-main (1)\MediaCrawler-main")
@@ -62,7 +66,7 @@ class MediaCrawlerClient:
             headers={"Content-Type": "application/json"} if data else {},
         )
         try:
-            with urlopen(request, timeout=8) as response:
+            with _OPENER.open(request, timeout=8) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 
 DEFAULT_ROOT = Path(r"D:\24\MediaCrawler-main (1)\MediaCrawler-main")
 DEFAULT_API_URL = "http://127.0.0.1:8090"
+
+# 本机 HTTP_PROXY 会拦截访问 127.0.0.1 的请求（挂起或 502），本地调用一律绕代理。
+_OPENER = build_opener(ProxyHandler({}))
 
 # 进程句柄追踪：只记录“由本后端进程拉起”的服务，外部手工启动的不会被记录。
 _managed_process: subprocess.Popen[str] | None = None
@@ -49,7 +53,7 @@ def _log_path() -> Path:
 def _fetch_crawler_status(timeout: float = 1.0) -> dict | None:
     url = f"{media_crawler_api_url()}/api/crawler/status"
     try:
-        with urlopen(url, timeout=timeout) as response:
+        with _OPENER.open(url, timeout=timeout) as response:
             if response.status != 200:
                 return None
             payload = json.loads(response.read().decode("utf-8"))
@@ -88,6 +92,70 @@ def _build_command(root: Path) -> list[str]:
     return ["uv", "run", "uvicorn", "api.main:app", "--host", host, "--port", str(port)]
 
 
+# config.USER_DATA_DIR 默认值（%s 由平台名填充，如 dy）
+_DEFAULT_USER_DATA_DIR = "%s_user_data_dir"
+
+# 当前账号专属的 user-data-dir 名（由账号服务切换账号时设置）
+_account_user_data_dir: str | None = None
+
+
+def set_account_user_data_dir(name: str | None) -> None:
+    """切换账号后调用：下次拉起 MediaCrawler 时使用账号专属登录目录。"""
+    global _account_user_data_dir
+    _account_user_data_dir = name or None
+
+
+def _clear_config_cache(root: Path) -> None:
+    """删除 base_config 的字节码缓存，避免改完 .py 仍加载旧值。"""
+    cache_dir = root / "config" / "__pycache__"
+    if not cache_dir.is_dir():
+        return
+    for pyc in cache_dir.glob("base_config*.pyc"):
+        try:
+            pyc.unlink()
+        except OSError:
+            pass
+
+
+def _ensure_douyin_platform(root: Path, user_data_dir: str | None = None) -> None:
+    """启动前校准 MediaCrawler 配置：平台恒为抖音 + 账号专属登录目录。
+
+    - PLATFORM 必须为 "dy"：被改成 xhs 等会让采集打开小红书登录页。
+    - USER_DATA_DIR 按账号隔离：传入账号专属名时写作 "acct_xxx_%s_user_data_dir"，
+      CDP 模式展开为 browser_data/cdp_acct_xxx_dy_user_data_dir，与
+      core.douyin_profile.profile_dir_for() 保持一致。
+    """
+    cfg = root / "config" / "base_config.py"
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    changed = False
+    if not re.search(r'^PLATFORM\s*=\s*["\']dy["\']', text, re.M):
+        new = re.sub(r'^PLATFORM\s*=\s*["\'][^"\']*["\']', 'PLATFORM = "dy"', text, flags=re.M)
+        if new != text:
+            text, changed = new, True
+
+    want_udd = user_data_dir or _DEFAULT_USER_DATA_DIR
+    if not re.search(r'^USER_DATA_DIR\s*=\s*["\']' + re.escape(want_udd) + r'["\']', text, re.M):
+        new = re.sub(
+            r'^USER_DATA_DIR\s*=\s*["\'][^"\']*["\']',
+            'USER_DATA_DIR = "' + want_udd + '"',
+            text,
+            flags=re.M,
+        )
+        if new != text:
+            text, changed = new, True
+
+    if changed:
+        try:
+            cfg.write_text(text, encoding="utf-8")
+        except OSError:
+            return
+        _clear_config_cache(root)
+
+
 def _open_log_target() -> object:
     global _log_handle
     try:
@@ -105,6 +173,7 @@ def _launch() -> subprocess.Popen[str] | None:
 
     root = Path(os.getenv("MEDIA_CRAWLER_ROOT", str(DEFAULT_ROOT)))
     _managed_root = root
+    _ensure_douyin_platform(root, _account_user_data_dir)
     if not (root / "pyproject.toml").exists():
         _last_start_error = f"MediaCrawler 目录无效（缺少 pyproject.toml）：{root}"
         return None

@@ -46,14 +46,15 @@
   }
 
   async function apiFetch(path, options = {}) {
+    const { timeout = FETCH_TIMEOUT, ...init } = options; // 允许调用方放宽超时
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
     _showLoading();
     try {
       const res = await fetch(API_BASE + path, {
-        ...options,
+        ...init,
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
       });
       clearTimeout(timeoutId);
       if (!res.ok) {

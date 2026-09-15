@@ -31,7 +31,7 @@ from app.schemas.settings import (
 _CST = timezone(timedelta(hours=8))
 
 # P2-8: whitelist of allowed AI providers
-_ALLOWED_PROVIDERS = {"doubao", "dashscope"}
+_ALLOWED_PROVIDERS = {"doubao", "dashscope", "openai"}
 
 # 分类常量
 CAT_AI = "ai"
@@ -42,7 +42,7 @@ CAT_NOTIFICATION = "notification"
 
 # 各分类的字段名集合（用于审计日志描述）
 _CATEGORY_FIELDS: dict[str, list[str]] = {
-    CAT_AI: ["provider", "api_key", "model", "temperature", "timeout"],
+    CAT_AI: ["provider", "api_key", "model", "base_url", "temperature", "timeout"],
     CAT_STRATEGY: ["auto_score_threshold", "r2_switch_threshold", "daily_frequency_limit"],
     CAT_COMPLIANCE: ["r1_threshold", "r1_enabled", "r2_threshold", "r2_enabled", "r3_threshold", "r3_enabled"],
     CAT_CRAWL: ["default_keywords", "crawl_interval_minutes", "max_comments_per_video"],
@@ -212,8 +212,12 @@ class SettingsService:
         ai.masked_key = mk
         return ai
 
+    def get_ai_settings_raw(self) -> AISettings:
+        """未脱敏的原始 AI 配置，仅供内部热更新读取真实 api_key 使用（绝不用于 API 响应）。"""
+        return self._read_category(CAT_AI, AISettings)
+
     # P1-16: provider -> default model mapping
-    _PROVIDER_DEFAULT_MODELS = {"doubao": "", "dashscope": "qwen-plus"}
+    _PROVIDER_DEFAULT_MODELS = {"doubao": "", "dashscope": "qwen-plus", "openai": ""}
 
     def update_ai_settings(self, data: AISettingsUpdate) -> AISettings:
         # P1-16: when provider changes, auto-reset model to provider default
@@ -284,6 +288,9 @@ class SettingsService:
         """发送最小请求验证 API Key 有效性，返回成功/失败/延迟。"""
         from urllib import error, request as urlrequest
 
+        # 外呼统一绕过本机 HTTP 代理（环境存在 HTTP_PROXY 会让外网请求失败）
+        _opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+
         provider = req.provider.lower().strip()
         api_key = req.api_key.strip()
         model = req.model.strip()
@@ -308,6 +315,15 @@ class SettingsService:
                 "input": {"messages": [{"role": "user", "content": "ping"}]},
                 "parameters": {"result_format": "message", "max_tokens": 5, "temperature": 0},
             }
+        elif provider == "openai":
+            base = (req.base_url or "https://api.openai.com/v1").strip().rstrip("/")
+            endpoint = base + "/chat/completions"
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 5,
+                "temperature": 0,
+            }
         else:
             return TestAIResponse(success=False, message=f"不支持的 provider: {provider}", latency_ms=0)
 
@@ -323,13 +339,13 @@ class SettingsService:
 
         start = time.monotonic()
         try:
-            with urlrequest.urlopen(req_obj, timeout=timeout) as resp:
+            with _opener.open(req_obj, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 result = json.loads(raw)
             latency_ms = int((time.monotonic() - start) * 1000)
 
             # 验证返回结构
-            if provider == "doubao":
+            if provider in ("doubao", "openai"):
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
             else:
                 content = result.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")

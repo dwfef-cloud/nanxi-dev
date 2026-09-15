@@ -13,13 +13,14 @@
 
   /* ── 统一 fetch 封装 ── */
   async function apiFetch(path, options = {}) {
+    const { timeout = FETCH_TIMEOUT, ...init } = options; // 允许调用方放宽超时
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
     try {
       const res = await fetch(API_BASE + path, {
-        ...options,
+        ...init,
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
       });
       clearTimeout(timeoutId);
       if (!res.ok) {
@@ -73,6 +74,15 @@
   async function updateAISettings(data) {
     const body = JSON.stringify(data || {});
     return apiFetch('/settings/ai', { method: 'PUT', body });
+  }
+
+  /**
+   * 拉取 OpenAI 兼容 provider 的可用模型列表
+   * GET /api/ai/models
+   * @returns {Promise<Object>} { provider, base_url, models: string[] }
+   */
+  async function fetchAIModels() {
+    return apiFetch('/ai/models');
   }
 
   /* ════════ 话术策略配置 ════════ */
@@ -139,6 +149,7 @@
     updateSettings,
     fetchAISettings,
     updateAISettings,
+    fetchAIModels,
     fetchStrategySettings,
     updateStrategySettings,
     fetchComplianceSettings,

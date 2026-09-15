@@ -1,4 +1,4 @@
-"""
+﻿"""
 数据库初始化模块
 ================
 负责：
@@ -185,27 +185,29 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
         default_templates,
     )
 
-    # ── 配置域单例（5张表各一条 default 记录）──
+    # ── 配置域画像表（各一条 default 记录，首条即主记录 is_primary=1）──
     conn.execute(
         """INSERT OR IGNORE INTO business_profile
-           (id, industry, product, service_area, target_customer,
-            price_range, conversion_goal, tone, updated_at)
-           VALUES ('default', '', '', '', '', '', '添加微信', '专业、真诚', ?)""",
-        (now,),
+           (id, industry, service_area, conversion_goal, tone,
+            is_primary, sort_order, created_at, updated_at)
+           VALUES ('default', '', '', '添加微信', '专业、真诚', 1, 0, ?, ?)""",
+        (now, now),
     )
     conn.execute(
         """INSERT OR IGNORE INTO product_knowledge
-           (id, product_name, description, selling_points, target_customers,
-            price_range, faq, forbidden_claims, updated_at)
-           VALUES ('default', '', '', '', '', '', '', '', ?)""",
-        (now,),
+           (id, product_name, description, selling_points,
+            price_range, faq, forbidden_claims,
+            is_primary, sort_order, created_at, updated_at)
+           VALUES ('default', '', '', '', '', '', '', 1, 0, ?, ?)""",
+        (now, now),
     )
     conn.execute(
         """INSERT OR IGNORE INTO audience_profile
-           (id, name, industry, region, needs, pain_points,
-            intent_keywords, excluded_keywords, updated_at)
-           VALUES ('default', '', '', '', '', '', '', '', ?)""",
-        (now,),
+           (id, name, needs, pain_points,
+            intent_keywords, excluded_keywords,
+            is_primary, sort_order, created_at, updated_at)
+           VALUES ('default', '', '', '', '', '', 1, 0, ?, ?)""",
+        (now, now),
     )
     conn.execute(
         """INSERT OR IGNORE INTO script_strategy
@@ -216,9 +218,10 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """INSERT OR IGNORE INTO wechat_settings
-           (id, wechat_id, guide_timing, guide_reason, compliance_note, updated_at)
-           VALUES ('default', '', '客户明确表达兴趣后', '发送详细方案和案例', '', ?)""",
-        (now,),
+           (id, wechat_id, guide_timing, guide_reason, compliance_note,
+            is_primary, sort_order, created_at, updated_at)
+           VALUES ('default', '', '客户明确表达兴趣后', '发送详细方案和案例', '', 1, 0, ?, ?)""",
+        (now, now),
     )
 
     # ── 调度器配置单例 ──

@@ -1,4 +1,4 @@
--- ============================================================
+﻿-- ============================================================
 -- 获客系统 SQLite 数据库 Schema
 -- 设计原则：
 --   1. datetime 存 ISO 字符串 (TEXT)
@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     r1_note             TEXT,
     r3_note             TEXT,
     notes               TEXT NOT NULL DEFAULT '',
+    -- 账号专属 Chrome 登录目录名；空 = 沿用默认共享目录 cdp_dy_user_data_dir
+    profile_dir         TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -129,6 +131,10 @@ CREATE TABLE IF NOT EXISTS comment_tasks (
     lead_id             TEXT NOT NULL,
     comment_content     TEXT NOT NULL DEFAULT '',
     video_title         TEXT NOT NULL DEFAULT '',
+    -- v009：评论人 / 评论时间 / 视频 ID（推送到待办互动后回复页要能直接看到）
+    comment_author      TEXT NOT NULL DEFAULT '',
+    comment_time        TEXT NOT NULL DEFAULT '',
+    video_id            TEXT NOT NULL DEFAULT '',
     -- 精准获客（v002）
     video_url           TEXT NOT NULL DEFAULT '',
     comment_id          TEXT NOT NULL DEFAULT '',
@@ -290,7 +296,9 @@ CREATE TABLE IF NOT EXISTS behavior_events (
 CREATE INDEX IF NOT EXISTS idx_behavior_lead ON behavior_events(lead_id);
 
 -- ═══════════════════════════════════════════════════════════
--- 配置域（单例表）
+-- 配置域（画像表：支持多条记录 + 主记录 is_primary）
+--   每条记录一个 id（首条为 'default'），is_primary=1 的那条是「主记录」，
+--   话术变量 / AI 生成 / 旧单数接口统一取主记录。
 -- ═══════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS business_profile (
@@ -302,6 +310,10 @@ CREATE TABLE IF NOT EXISTS business_profile (
     price_range         TEXT NOT NULL DEFAULT '',
     conversion_goal     TEXT NOT NULL DEFAULT '添加微信',
     tone                TEXT NOT NULL DEFAULT '专业、真诚',
+    self_intro          TEXT NOT NULL DEFAULT '',
+    is_primary          INTEGER NOT NULL DEFAULT 1,
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT '',
     updated_at          TEXT NOT NULL
 );
 
@@ -314,6 +326,11 @@ CREATE TABLE IF NOT EXISTS product_knowledge (
     price_range         TEXT NOT NULL DEFAULT '',
     faq                 TEXT NOT NULL DEFAULT '',
     forbidden_claims    TEXT NOT NULL DEFAULT '',
+    service_process     TEXT NOT NULL DEFAULT '',
+    case_studies        TEXT NOT NULL DEFAULT '',
+    is_primary          INTEGER NOT NULL DEFAULT 1,
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT '',
     updated_at          TEXT NOT NULL
 );
 
@@ -326,6 +343,10 @@ CREATE TABLE IF NOT EXISTS audience_profile (
     pain_points         TEXT NOT NULL DEFAULT '',
     intent_keywords     TEXT NOT NULL DEFAULT '',
     excluded_keywords   TEXT NOT NULL DEFAULT '',
+    excluded_customers  TEXT NOT NULL DEFAULT '',
+    is_primary          INTEGER NOT NULL DEFAULT 1,
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT '',
     updated_at          TEXT NOT NULL
 );
 
@@ -344,6 +365,10 @@ CREATE TABLE IF NOT EXISTS wechat_settings (
     guide_timing        TEXT NOT NULL DEFAULT '客户明确表达兴趣后',
     guide_reason        TEXT NOT NULL DEFAULT '发送详细方案和案例',
     compliance_note     TEXT NOT NULL DEFAULT '',
+    offer_hook          TEXT NOT NULL DEFAULT '',
+    is_primary          INTEGER NOT NULL DEFAULT 1,
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT '',
     updated_at          TEXT NOT NULL
 );
 

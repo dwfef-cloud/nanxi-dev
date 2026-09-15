@@ -47,6 +47,31 @@ from douyin_comments import (  # noqa: E402
 
 DEFAULT_DATA_DIR = Path(os.environ.get("COMMENT_AGENT_DATA_DIR") or r"D:\nanxi-dev\.data\comment_agent")
 DEFAULT_CDP_PORT = int(os.environ.get("DOUYIN_CDP_PORT") or 9222)
+# 当前账号的登录目录（后端「切换账号」时写入，子进程据此切换登录态）
+_ACTIVE_PROFILE_FILE = Path(r"D:\nanxi-dev\.data\active_douyin_profile.json")
+
+
+def _resolve_comment_profile() -> Path:
+    """评论自动化浏览器与 MediaCrawler 共用抖音登录态。
+
+    复用 MediaCrawler 的 cdp_dy_user_data_dir：在「上线向导→扫码登录」一次登录后，
+    待办互动的评论发送即可直接复用同一份抖音 Cookie，解决两套浏览器登录态割裂的问题。
+    可用 DOUYIN_BROWSER_PROFILE 环境变量覆盖（指向任意 Chrome user-data-dir）。
+    """
+    env = os.environ.get("DOUYIN_BROWSER_PROFILE")
+    if env:
+        return Path(env)
+    # 多账号隔离：优先用「账号管理 → 切换账号」写下的当前账号专属目录。
+    # 本模块跑在独立子进程里，读不到后端的 Repository，故由状态文件传递。
+    try:
+        data = json.loads(_ACTIVE_PROFILE_FILE.read_text(encoding="utf-8"))
+        p = (data.get("profileDir") or "").strip()
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    mc_root = os.environ.get("MEDIA_CRAWLER_ROOT") or r"D:\24\MediaCrawler-main (1)\MediaCrawler-main"
+    return Path(mc_root) / "browser_data" / "cdp_dy_user_data_dir"
 # 定位目标评论时的最大滚动轮数（每轮 400px，约 2 条评论）。抖音评论是虚拟列表，
 # 单轮渲染窗口很小，必须小步多轮才能不漏。评论量大的视频需要更多轮。
 DEFAULT_MAX_SCROLLS = int(os.environ.get("COMMENT_LOCATE_MAX_SCROLLS") or 30)
@@ -121,7 +146,7 @@ def launch_browser(port: int = DEFAULT_CDP_PORT, data_dir: Path = DEFAULT_DATA_D
     exe = _find_browser_exe()
     if not exe:
         raise AgentError("未找到 Chrome/Edge，请安装浏览器或设置 PLAYWRIGHT_CHROMIUM_PATH")
-    profile = data_dir / "browser_profile"
+    profile = _resolve_comment_profile()
     profile.mkdir(parents=True, exist_ok=True)
     # CREATE_NEW_PROCESS_GROUP：让浏览器脱离本代理进程独立存活（代理执行完即退出）
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -464,7 +489,7 @@ async def do_status(payload: dict) -> dict:
     out = {
         "cdp_ready": cdp_ready(port),
         "port": port,
-        "profile_dir": str(data_dir / "browser_profile"),
+        "profile_dir": str(_resolve_comment_profile()),
         "logged_in": None,
         "page_count": 0,
         "douyin_pages": 0,
@@ -518,7 +543,7 @@ async def do_launch(payload: dict) -> dict:
         "cdp_ready": True,
         "port": port,
         "logged_in": logged_in,
-        "profile_dir": str(data_dir / "browser_profile"),
+        "profile_dir": str(_resolve_comment_profile()),
         "message": info["message"] if not logged_in else "已登录抖音，可以执行评论回复",
     }
 

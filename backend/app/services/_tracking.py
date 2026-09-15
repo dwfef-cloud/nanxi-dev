@@ -39,6 +39,25 @@ def log_lead_event(
         )
 
 
+def _apply_r2_for_scripts(repo: Repository, script_ids: set[str]) -> None:
+    """结果回写后跑一次 R2 自动停用（样本够但加微转化率低的变体）。
+
+    延迟 import：script_service 与本模块同在 services 包，顶层 import 会绕回依赖。
+    失败只记日志 —— 统计与自动停用属于增强，不能拖垮发送主流程。
+    """
+    ids = {s for s in script_ids if s}
+    if not ids:
+        return
+    try:
+        from app.services.script_service import ScriptService
+
+        service = ScriptService(repo)
+        for script_id in ids:
+            service.apply_r2(script_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("埋点失败 R2 自动停用: scripts=%s err=%s", ids, e, exc_info=True)
+
+
 def record_script_usage(
     repo: Repository,
     *,
@@ -83,9 +102,16 @@ def record_script_usage(
             script_id, variant_id, e, exc_info=True,
         )
 
+    # 发送数变了，样本量可能刚跨过阈值 → 跑一次 R2 判断
+    _apply_r2_for_scripts(repo, {script_id})
+
 
 def mark_script_result(repo: Repository, lead_id: str | None, result: str) -> None:
-    """线索加微 / 客户成交时，回写关联该 lead_id 的 script_usage.result。"""
+    """线索加微 / 客户成交时，回写关联该 lead_id 的 script_usage.result。
+
+    回写后立刻重算相关话术的变体统计并执行 R2 自动停用 —— 这是「加微转化率」
+    真正变化的时刻，也是 R2 唯一有意义的触发点。
+    """
     if not lead_id:
         return
     try:
@@ -95,6 +121,13 @@ def mark_script_result(repo: Repository, lead_id: str | None, result: str) -> No
             "埋点失败 mark_script_result: lead_id=%s result=%s err=%s",
             lead_id, result, e, exc_info=True,
         )
+        return
+
+    try:
+        usages = repo.list_script_usages(lead_id=lead_id)
+    except Exception:
+        usages = []
+    _apply_r2_for_scripts(repo, {u.script_id for u in usages})
 
 
 def record_account_event(

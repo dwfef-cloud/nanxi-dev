@@ -52,12 +52,12 @@ class MemoryRepository(Repository):
         self._behavior_events: dict[str, LeadBehaviorEvent] = {}
         # ── 采集域 ──
         self._crawl_tasks: dict[str, CrawlTask] = {}
-        # ── 配置域 ──
-        self._business_profile = BusinessProfile()
-        self._product_knowledge = ProductKnowledge()
-        self._audience_profile = AudienceProfile()
+        # ── 配置域 · 画像表（多条记录 + 主记录）──
+        self._business_profiles: dict[str, BusinessProfile] = {"default": BusinessProfile()}
+        self._product_knowledge_items: dict[str, ProductKnowledge] = {"default": ProductKnowledge()}
+        self._audience_profiles: dict[str, AudienceProfile] = {"default": AudienceProfile()}
         self._script_strategy = ScriptStrategy()
-        self._wechat_settings = WeChatSettings()
+        self._wechat_settings_items: dict[str, WeChatSettings] = {"default": WeChatSettings()}
         # ── 系统配置中心 ──
         self._system_settings: dict[str, dict[str, str]] = {}
         # ── 通知域（P4-A）──
@@ -149,12 +149,29 @@ class MemoryRepository(Repository):
         self._scripts[script.id] = script
         return script
 
+    def delete_script(self, script_id: str) -> None:
+        if script_id not in self._scripts:
+            raise KeyError(f"Script not found: {script_id}")
+        for vid in [v.id for v in self._variants.values() if v.script_id == script_id]:
+            del self._variants[vid]
+        del self._scripts[script_id]
+
     def list_variants(self, script_id: str) -> list[ScriptVariant]:
         return [v for v in self._variants.values() if v.script_id == script_id]
 
     def save_variant(self, variant: ScriptVariant) -> ScriptVariant:
         self._variants[variant.id] = variant
         return variant
+
+    def delete_variant(self, script_id: str, variant_id: str) -> None:
+        target = next(
+            (v for v in self._variants.values()
+             if v.script_id == script_id and v.variant_id == variant_id),
+            None,
+        )
+        if target is None:
+            raise KeyError(f"Variant {variant_id} not found in script {script_id}")
+        del self._variants[target.id]
 
     def list_script_templates(self) -> list[ScriptTemplate]:
         return list(self._script_templates)
@@ -175,6 +192,11 @@ class MemoryRepository(Repository):
     def save_comment_task(self, task: CommentReplyTask) -> CommentReplyTask:
         self._comment_tasks[task.id] = task
         return task
+
+    def delete_comment_task(self, task_id: str) -> None:
+        if task_id not in self._comment_tasks:
+            raise KeyError(f"CommentTask not found: {task_id}")
+        del self._comment_tasks[task_id]
 
     # ═══════════════════════════════════════════════════════
     # Customer / Log
@@ -328,29 +350,92 @@ class MemoryRepository(Repository):
         self._crawl_tasks.pop(task_id, None)
 
     # ═══════════════════════════════════════════════════════
-    # 配置域
+    # 配置域 · 画像表（多条记录 + 主记录 is_primary）
     # ═══════════════════════════════════════════════════════
 
+    @staticmethod
+    def _sorted_records(store: dict) -> list:
+        """主记录排最前，其次按 sort_order / created_at"""
+        return sorted(
+            store.values(),
+            key=lambda r: (not r.is_primary, r.sort_order, r.created_at),
+        )
+
+    @staticmethod
+    def _set_primary(store: dict, record_id: str) -> None:
+        for rec in store.values():
+            rec.is_primary = rec.id == record_id
+
+    def _drop_record(self, store: dict, record_id: str) -> None:
+        store.pop(record_id, None)
+        if store and not any(r.is_primary for r in store.values()):
+            self._sorted_records(store)[0].is_primary = True
+
     def get_business_profile(self) -> BusinessProfile:
-        return self._business_profile
+        rows = self._sorted_records(self._business_profiles)
+        return rows[0] if rows else BusinessProfile()
+
+    def list_business_profiles(self) -> list[BusinessProfile]:
+        return self._sorted_records(self._business_profiles)
+
+    def get_business_profile_by_id(self, record_id: str) -> BusinessProfile | None:
+        return self._business_profiles.get(record_id)
 
     def save_business_profile(self, profile: BusinessProfile) -> BusinessProfile:
-        self._business_profile = profile
+        self._business_profiles[profile.id] = profile
+        if profile.is_primary:
+            self._set_primary(self._business_profiles, profile.id)
         return profile
 
+    def delete_business_profile(self, record_id: str) -> None:
+        self._drop_record(self._business_profiles, record_id)
+
+    def set_primary_business_profile(self, record_id: str) -> None:
+        self._set_primary(self._business_profiles, record_id)
+
     def get_product_knowledge(self) -> ProductKnowledge:
-        return self._product_knowledge
+        rows = self._sorted_records(self._product_knowledge_items)
+        return rows[0] if rows else ProductKnowledge()
+
+    def list_product_knowledge(self) -> list[ProductKnowledge]:
+        return self._sorted_records(self._product_knowledge_items)
+
+    def get_product_knowledge_by_id(self, record_id: str) -> ProductKnowledge | None:
+        return self._product_knowledge_items.get(record_id)
 
     def save_product_knowledge(self, value: ProductKnowledge) -> ProductKnowledge:
-        self._product_knowledge = value
+        self._product_knowledge_items[value.id] = value
+        if value.is_primary:
+            self._set_primary(self._product_knowledge_items, value.id)
         return value
+
+    def delete_product_knowledge(self, record_id: str) -> None:
+        self._drop_record(self._product_knowledge_items, record_id)
+
+    def set_primary_product_knowledge(self, record_id: str) -> None:
+        self._set_primary(self._product_knowledge_items, record_id)
 
     def get_audience_profile(self) -> AudienceProfile:
-        return self._audience_profile
+        rows = self._sorted_records(self._audience_profiles)
+        return rows[0] if rows else AudienceProfile()
+
+    def list_audience_profiles(self) -> list[AudienceProfile]:
+        return self._sorted_records(self._audience_profiles)
+
+    def get_audience_profile_by_id(self, record_id: str) -> AudienceProfile | None:
+        return self._audience_profiles.get(record_id)
 
     def save_audience_profile(self, value: AudienceProfile) -> AudienceProfile:
-        self._audience_profile = value
+        self._audience_profiles[value.id] = value
+        if value.is_primary:
+            self._set_primary(self._audience_profiles, value.id)
         return value
+
+    def delete_audience_profile(self, record_id: str) -> None:
+        self._drop_record(self._audience_profiles, record_id)
+
+    def set_primary_audience_profile(self, record_id: str) -> None:
+        self._set_primary(self._audience_profiles, record_id)
 
     def get_script_strategy(self) -> ScriptStrategy:
         return self._script_strategy
@@ -360,11 +445,26 @@ class MemoryRepository(Repository):
         return value
 
     def get_wechat_settings(self) -> WeChatSettings:
-        return self._wechat_settings
+        rows = self._sorted_records(self._wechat_settings_items)
+        return rows[0] if rows else WeChatSettings()
+
+    def list_wechat_settings(self) -> list[WeChatSettings]:
+        return self._sorted_records(self._wechat_settings_items)
+
+    def get_wechat_settings_by_id(self, record_id: str) -> WeChatSettings | None:
+        return self._wechat_settings_items.get(record_id)
 
     def save_wechat_settings(self, value: WeChatSettings) -> WeChatSettings:
-        self._wechat_settings = value
+        self._wechat_settings_items[value.id] = value
+        if value.is_primary:
+            self._set_primary(self._wechat_settings_items, value.id)
         return value
+
+    def delete_wechat_settings(self, record_id: str) -> None:
+        self._drop_record(self._wechat_settings_items, record_id)
+
+    def set_primary_wechat_settings(self, record_id: str) -> None:
+        self._set_primary(self._wechat_settings_items, record_id)
 
     # ═══════════════════════════════════════════════════════
     # 系统配置中心 · key-value

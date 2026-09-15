@@ -46,6 +46,7 @@ class AISettingsRead(BaseModel):
     configured: bool
     masked_key: str
     model: str
+    base_url: str = ""
 
 
 # ═══════════════════════════════════════════════════════════

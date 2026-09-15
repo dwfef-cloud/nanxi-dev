@@ -58,15 +58,26 @@ def list_customers(
 
 @router.get("/stage-meta")
 def get_stage_meta() -> dict:
-    """商机阶段元数据（7个阶段的标签、颜色、顺序）"""
+    """商机阶段元数据（7 个阶段：标签 / 颜色 / 顺序 / 通用说明）
+
+    通用成交流程，不绑定任何行业：原「已量房」为装修专属，已改为「需求沟通」。
+    `desc` 供前端做悬停说明，让非装修行业的用户也知道每个阶段指什么。
+    """
     return {
-        "added": {"label": "已加微", "cls": "wechat", "order": 1},
-        "measured": {"label": "已量房", "cls": "sent", "order": 2},
-        "proposal": {"label": "方案中", "cls": "pending", "order": 3},
-        "quoted": {"label": "已报价", "cls": "throttled", "order": 4},
-        "negotiating": {"label": "谈判中", "cls": "mid", "order": 5},
-        "won": {"label": "已成交", "cls": "deal", "order": 6},
-        "lost": {"label": "已流失", "cls": "rejected", "order": 7},
+        "added": {"label": "已加微", "cls": "wechat", "order": 1,
+                  "desc": "已建立联系（加微成功），等待首次沟通"},
+        "discovery": {"label": "需求沟通", "cls": "sent", "order": 2,
+                      "desc": "已沟通清楚客户的需求、预算与关键信息"},
+        "proposal": {"label": "方案中", "cls": "pending", "order": 3,
+                     "desc": "正在准备方案 / 给建议（实物商品类可跳过）"},
+        "quoted": {"label": "已报价", "cls": "throttled", "order": 4,
+                   "desc": "方案或价格已发出，等待客户反馈"},
+        "negotiating": {"label": "谈判中", "cls": "mid", "order": 5,
+                        "desc": "正在沟通条款 / 优惠，推进签约"},
+        "won": {"label": "已成交", "cls": "deal", "order": 6,
+                "desc": "已付款成交"},
+        "lost": {"label": "已流失", "cls": "rejected", "order": 7,
+                 "desc": "确认不做了 / 已选竞品，沉淀流失原因"},
     }
 
 

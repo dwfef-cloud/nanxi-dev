@@ -21,6 +21,8 @@ from app.api.routes.followups import router as followups_router
 from app.api.routes.leads import router as leads_router
 from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.scripts import router as scripts_router
+from app.api.routes.script_gen import router as script_gen_router
+from app.api.routes.profile_records import router as profile_records_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.analytics import router as analytics_router
 from app.api.routes.behavior import router as behavior_router
@@ -33,6 +35,7 @@ from app.api.routes.dm_sender import router as dm_sender_router
 from app.api.routes.notifications import router as notifications_router
 from app.api.routes.monitor import router as monitor_router
 from app.api.routes.backup import router as backup_router
+from app.api.routes.import_material import router as materials_router
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(health_router)
@@ -68,3 +71,6 @@ api_router.include_router(notifications_router)
 api_router.include_router(monitor_router)
 api_router.include_router(backup_router)
 api_router.include_router(dm_sender_router)
+api_router.include_router(materials_router)
+api_router.include_router(script_gen_router)
+api_router.include_router(profile_records_router)

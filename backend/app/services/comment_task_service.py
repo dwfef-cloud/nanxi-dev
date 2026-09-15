@@ -9,13 +9,26 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+from app.core import douyin_profile
 from app.core.douyin_url import extract_comment_id, usable_video_url
 from app.models.domain import CommentReplyTask, now_utc
 from app.repositories.base import Repository
-from app.schemas.comment_task import CommentTaskCreate, CommentTaskRead, CommentTaskUpdate
+from app.schemas.comment_task import (
+    CommentTaskCreate,
+    CommentTaskPushItem,
+    CommentTaskPushRequest,
+    CommentTaskPushResponse,
+    CommentTaskRead,
+    CommentTaskUpdate,
+)
 from app.services import _tracking
 
 logger = logging.getLogger(__name__)
+
+# 未闭环的任务状态：同一条线索处于这些状态时，重复推送视为重复，跳过
+_OPEN_STATUSES = frozenset({
+    "pending", "locating", "replying", "replied", "user_replied", "user_dm",
+})
 
 
 class CommentTaskService:
@@ -29,36 +42,229 @@ class CommentTaskService:
 
     def list_tasks(self, status: str | None = None) -> list[CommentTaskRead]:
         tasks = self._repo.list_comment_tasks(status=status)
+        # v009：老任务缺「评论人 / 视频 ID / 评论时间」，读时从线索补一次并落库
+        # （补过之后字段非空，后续读取不再查线索）
+        for t in tasks:
+            self._backfill_detail(t)
         return [self._to_read(t) for t in tasks]
 
     def get_task(self, task_id: str) -> CommentTaskRead:
         task = self._repo.get_comment_task(task_id)
+        self._backfill_detail(task)
         return self._to_read(task)
 
     def create_task(self, payload: CommentTaskCreate) -> CommentTaskRead:
         """创建评论回复任务（从高意向线索生成）
 
+        v009：字段全量兜底——从关联线索补齐「评论人昵称 / 评论时间 / 视频 ID /
+        视频标题 / 视频链接 / 评论 ID / 负责账号」。候选池推过来的任务必须自带完整
+        上下文，否则「待办互动 → 评论回复」看到的是一堆空白。
+
         video_url 兜底：任务不带地址（或是 /video/999 这类占位地址）时，
         回落到关联线索的来源视频。库里早期任务全是占位地址，靠这层兜底
         才能真的定位到评论区。
         """
-        video_url = self._resolve_video_url(payload)
-        comment_id = self._resolve_comment_id(payload)
+        enriched = self._enrich_from_lead(payload)
+        video_url = self._resolve_video_url(enriched)
+        comment_id = self._resolve_comment_id(enriched)
         task = CommentReplyTask(
-            lead_id=payload.lead_id,
-            comment_content=payload.comment_content,
-            video_title=payload.video_title,
-            reply_content=payload.reply_content,
-            account=payload.account,
-            reply_script_id=payload.reply_script_id,
+            lead_id=enriched.lead_id,
+            comment_content=enriched.comment_content,
+            video_title=enriched.video_title,
+            reply_content=enriched.reply_content,
+            account=enriched.account,
+            reply_script_id=enriched.reply_script_id,
+            # v009：完整上下文
+            comment_author=enriched.comment_author,
+            comment_time=enriched.comment_time,
+            video_id=enriched.video_id,
             # 精准获客（v002）：新字段透传，未传时走领域默认值
             video_url=video_url,
             comment_id=comment_id,
-            priority=payload.priority,
+            priority=enriched.priority,
             status="pending",
         )
         saved = self._repo.save_comment_task(task)
         return self._to_read(saved)
+
+    # ═══════════════════════════════════════════════════════
+    # v009 · 线索 → 任务字段补齐 / 批量推送
+    # ═══════════════════════════════════════════════════════
+
+    def _load_lead(self, lead_id: str):
+        if not lead_id:
+            return None
+        try:
+            return self._repo.get_lead(lead_id)
+        except KeyError:
+            return None
+        except Exception:
+            return None
+
+    def _active_account_name(self) -> str:
+        """当前激活账号的昵称（v008 多账号切换后跟随选中账号）。"""
+        try:
+            aid, _profile = douyin_profile.resolve_active_profile(self._repo)
+            if not aid:
+                return ""
+            acc = self._repo.get_account(aid)
+            return acc.nickname or acc.name or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _priority_of(lead) -> str:
+        """线索意向等级 → 任务优先级（A→P0 / B→P1 / 其余 P2）"""
+        lv = str(getattr(lead, "intent_level", "") or "").upper()
+        if lv == "A":
+            return "P0"
+        if lv == "B":
+            return "P1"
+        return "P2"
+
+    def _enrich_from_lead(self, payload: CommentTaskCreate) -> CommentTaskCreate:
+        """用关联线索补齐任务字段：只填空的，已显式传入的不覆盖。"""
+        lead = self._load_lead(payload.lead_id)
+        if lead is None:
+            # 没有线索也至少把账号补上，避免待办页「负责账号」一栏空白
+            if not payload.account:
+                payload.account = self._active_account_name() or None
+            return payload
+
+        def _fill(cur: str, val: str) -> str:
+            cur = (cur or "").strip()
+            val = (val or "").strip()
+            return cur if cur else val
+
+        payload.comment_content = _fill(payload.comment_content, getattr(lead, "comment", ""))
+        payload.video_title = _fill(payload.video_title, getattr(lead, "video", ""))
+        payload.video_id = _fill(payload.video_id, getattr(lead, "video_id", ""))
+        payload.comment_author = _fill(payload.comment_author, getattr(lead, "nickname", ""))
+        payload.comment_time = _fill(payload.comment_time, getattr(lead, "comment_time", ""))
+        payload.video_url = _fill(payload.video_url, getattr(lead, "source_url", ""))
+        payload.comment_id = _fill(payload.comment_id, getattr(lead, "comment_id", ""))
+        if not payload.account:
+            payload.account = (getattr(lead, "account", "") or "").strip() or self._active_account_name() or None
+        if not payload.priority or payload.priority == "P2":
+            payload.priority = self._priority_of(lead)  # type: ignore[assignment]
+        return payload
+
+    def _backfill_detail(self, task: CommentReplyTask) -> None:
+        """老任务缺 v009 字段时，从线索补一次并落库（best-effort）。
+
+        ⚠️ 只有「线索里确实取到了值」才写库。
+        线索本身也是空时（评论时间为空的老线索有 100+ 条），若照样把空值回写，
+        `changed` 就恒为 True，每次打开「待办互动」都会为这批任务各提交一次写事务
+        （表里每条 save 都是一次 commit + INSERT OR REPLACE），白白花掉 300ms 左右。
+        """
+        if task.comment_author and task.video_id and task.comment_time:
+            return
+        lead = self._load_lead(task.lead_id)
+        if lead is None:
+            return
+        changed = False
+        if not task.comment_author:
+            v = (getattr(lead, "nickname", "") or "").strip()
+            if v:
+                task.comment_author = v
+                changed = True
+        if not task.video_id:
+            v = (getattr(lead, "video_id", "") or "").strip()
+            if v:
+                task.video_id = v
+                changed = True
+        if not task.comment_time:
+            v = (getattr(lead, "comment_time", "") or "").strip()
+            if v:
+                task.comment_time = v
+                changed = True
+        if not task.video_title:
+            v = (getattr(lead, "video", "") or "").strip()
+            if v:
+                task.video_title = v
+                changed = True
+        if not task.video_url:
+            lead_url = (getattr(lead, "source_url", "") or "").strip()
+            if usable_video_url(lead_url):
+                task.video_url = lead_url
+                changed = True
+        if not task.comment_id:
+            cid = extract_comment_id(
+                external_id=getattr(lead, "external_id", "") or "",
+                comment_id=getattr(lead, "comment_id", "") or "",
+            )
+            if cid:
+                task.comment_id = cid
+                changed = True
+        if not task.account:
+            v = (getattr(lead, "account", "") or "").strip()
+            if v:
+                task.account = v
+                changed = True
+        if changed:
+            try:
+                self._repo.save_comment_task(task)
+            except Exception as e:
+                logger.warning(
+                    "回填任务上下文失败: task_id=%s err=%s", task.id, e,
+                )
+
+    def push_leads_to_tasks(self, req: CommentTaskPushRequest) -> CommentTaskPushResponse:
+        """把「评论候选池」里的线索批量推送到「待办互动 → 评论回复」。
+
+        幂等：同一线索已有未闭环任务时跳过。返回逐条结果，前端据此给出提示。
+        """
+        result = CommentTaskPushResponse()
+        lead_ids = [str(x).strip() for x in (req.lead_ids or []) if str(x).strip()]
+        if not lead_ids:
+            return result
+
+        open_by_lead: dict[str, str] = {}
+        for t in self._repo.list_comment_tasks():
+            if t.status in _OPEN_STATUSES and t.lead_id and t.lead_id not in open_by_lead:
+                open_by_lead[t.lead_id] = t.id
+
+        active_account = (req.account or "").strip() or self._active_account_name() or None
+
+        for lead_id in lead_ids:
+            existing = open_by_lead.get(lead_id)
+            if existing:
+                result.skipped += 1
+                result.items.append(CommentTaskPushItem(
+                    lead_id=lead_id, status="skipped", task_id=existing,
+                    reason="该线索已在待办互动中（未闭环），不重复推送",
+                ))
+                continue
+            lead = self._load_lead(lead_id)
+            if lead is None:
+                result.skipped += 1
+                result.items.append(CommentTaskPushItem(
+                    lead_id=lead_id, status="skipped", reason="线索不存在",
+                ))
+                continue
+            priority = req.priority or self._priority_of(lead)
+            try:
+                created = self.create_task(CommentTaskCreate(
+                    lead_id=lead_id,
+                    reply_content=req.reply_content or "",
+                    account=active_account,
+                    reply_script_id=req.reply_script_id,
+                    priority=priority,  # type: ignore[arg-type]
+                ))
+            except Exception as e:
+                logger.warning("推送线索到待办互动失败: lead_id=%s err=%s", lead_id, e)
+                result.skipped += 1
+                result.items.append(CommentTaskPushItem(
+                    lead_id=lead_id, status="skipped", reason=f"建任务失败：{e}",
+                ))
+                continue
+            result.created += 1
+            result.task_ids.append(created.id)
+            result.items.append(CommentTaskPushItem(
+                lead_id=lead_id, status="created", task_id=created.id,
+                comment_author=created.comment_author, video_title=created.video_title,
+            ))
+        return result
 
     def _resolve_comment_id(self, payload: CommentTaskCreate) -> str:
         """取评论 id：任务自带 → 关联线索的 comment_id / external_id 还原。
@@ -464,6 +670,10 @@ class CommentTaskService:
             lead_id=task.lead_id,
             comment_content=task.comment_content,
             video_title=task.video_title,
+            # v009：评论人 / 评论时间 / 视频 ID
+            comment_author=task.comment_author,
+            comment_time=task.comment_time,
+            video_id=task.video_id,
             reply_content=task.reply_content,
             status=task.status,
             account=task.account,
@@ -488,4 +698,10 @@ class CommentTaskService:
             # 话术归因（v004）
             reply_script_id=task.reply_script_id,
             reply_variant_id=task.reply_variant_id,
+            # 创建时间：评论时间为空时前端据此兜底排序
+            created_at=task.created_at,
         )
+
+    def delete_task(self, task_id: str) -> None:
+        """删除一条评论回复任务"""
+        self._repo.delete_comment_task(task_id)

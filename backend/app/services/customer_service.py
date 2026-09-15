@@ -13,10 +13,10 @@ from app.services import _tracking
 
 logger = logging.getLogger(__name__)
 
-# 7 阶段标签（用于日志文案）
+# 7 阶段标签（用于日志文案）。通用成交流程，不绑定行业。
 STAGE_LABELS: dict[str, str] = {
     "added": "已加微",
-    "measured": "已量房",
+    "discovery": "需求沟通",
     "proposal": "方案中",
     "quoted": "已报价",
     "negotiating": "谈判中",
@@ -27,8 +27,8 @@ STAGE_LABELS: dict[str, str] = {
 # P1-11: Stage transition guard - terminal states won't regress
 # Valid forward transitions per stage
 _STAGE_TRANSITIONS: dict[str, set[str]] = {
-    "added": {"measured", "proposal", "quoted", "negotiating", "won", "lost"},
-    "measured": {"proposal", "quoted", "negotiating", "won", "lost"},
+    "added": {"discovery", "proposal", "quoted", "negotiating", "won", "lost"},
+    "discovery": {"proposal", "quoted", "negotiating", "won", "lost"},
     "proposal": {"quoted", "negotiating", "won", "lost"},
     "quoted": {"negotiating", "won", "lost"},
     "negotiating": {"won", "lost"},
@@ -39,9 +39,10 @@ _STAGE_TRANSITIONS: dict[str, set[str]] = {
 TERMINAL_STAGES = {"won", "lost"}
 
 # P2-16：阶段推进后自动生成的 SOP 跟进模板（due=今天，进入今日跟进列表）
+# 文案保持行业中立，不出现「量房/装修」等专属措辞
 _STAGE_SOP: dict[str, tuple[str, str]] = {
-    "added": ("首次跟进", "发送欢迎语并确认装修需求与预算"),
-    "measured": ("方案推进", "跟进量房结果，约方案初稿沟通"),
+    "added": ("首次跟进", "发送欢迎语，确认客户需求与预算"),
+    "discovery": ("需求跟进", "确认需求细节，为出方案做准备"),
     "proposal": ("方案推进", "主动询问客户对方案的反馈"),
     "quoted": ("报价跟进", "回访报价，处理价格异议"),
     "negotiating": ("谈判", "推进成交谈判，敲定合同细节"),

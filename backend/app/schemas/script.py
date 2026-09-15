@@ -46,6 +46,7 @@ class VariantRead(_Camel):
     wechat_added: int | None = None
     conv_rate: float | None = None
     sample_enough: bool = False
+    r2_note: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -56,18 +57,26 @@ class ScriptCreate(_Camel):
     """新建话术请求"""
     name: str
     industry: str = "通用"
-    category: Literal["comment", "private_message", "wechat_guide", "objection", "nurture"] = "private_message"
+    category: Literal["comment", "welcome", "private_message", "wechat_guide", "objection", "nurture"] = "private_message"
     is_main: bool = False
     active: bool = True
     intro: str = ""
     welcome_msg: str = ""
+    source: str = "manual"
+    generated_from: str = ""
+    variables: str = ""
 
 
 class ScriptUpdate(_Camel):
-    """更新话术（启用/禁用、改名、改分类）"""
+    """更新话术（启用/禁用、改名、改分类、改备注与企微欢迎语）"""
     name: str | None = None
-    category: Literal["comment", "private_message", "wechat_guide", "objection", "nurture"] | None = None
+    category: Literal["comment", "welcome", "private_message", "wechat_guide", "objection", "nurture"] | None = None
     active: bool | None = None
+    intro: str | None = None
+    welcome_msg: str | None = None
+    source: str | None = None
+    generated_from: str | None = None
+    variables: str | None = None
 
 
 class ScriptRead(_Camel):
@@ -80,6 +89,9 @@ class ScriptRead(_Camel):
     active: bool
     intro: str
     welcome_msg: str
+    source: str = "manual"
+    generated_from: str = ""
+    variables: str = ""
     variants: list[VariantRead] = Field(default_factory=list)
 
 

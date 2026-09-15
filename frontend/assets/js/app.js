@@ -4,8 +4,8 @@
      工作台 · 获客（线索池/私信任务/话术库/抖音账号）
      · 客户管理（客户与商机/今日跟进）
      · 经营分析（转化漏斗/触点归因/账号健康度/合规风险）
-     · 设置（系统设置/业务配置/数据备份）
-     上线向导在「账号管理 → 上手向导」；业务配置 5 步在「系统设置 → 业务配置」
+     · 设置（系统设置/数据备份）
+     上线向导在「账号管理 → 上手向导」；业务配置 5 步与话术库合并在「话术与业务配置 → 业务画像」
    所有数据经 window.MOCK_API 获取（见 mock-data.js），
    本文件不含任何后端请求。
    ═══════════════════════════════════════════════════════════ */
@@ -45,22 +45,17 @@
   }
 
   /**
-   * 检测抖音登录态。未登录时提示并引导跳转上线向导「扫码登录」步骤。
-   * 返回 true=已登录（或检测失败放行，交给后端判断）；false=未登录且已引导跳转。
+   * 启动采集前的环境预检。
+   * 不弹窗、不铺文案：把结果合进页面上的「环境检查」清单并展开，
+   * 由用户自己在清单里点对应项的修复按钮。
+   * 返回 true=可以启动；false=有阻塞项，已展开清单。
    */
   async function ensureDouyinLogin() {
-    let loginOk = true;
-    try {
-      const rd = await API.getReadiness();
-      const dl = (rd.items || []).find((i) => i.key === 'douyin_login');
-      loginOk = !dl || dl.ok !== false;
-    } catch (e) {
-      loginOk = true; // 检测不到就放行，启动采集时由后端再判断
-    }
-    if (!loginOk) {
-      toast('抖音尚未登录，无法采集评论', 'warn');
-      const go = window.confirm('抖音尚未登录，无法采集评论。\n是否前往「上线向导」扫码登录抖音？');
-      if (go) { location.hash = '#/accounts?tab=wizard&step=login'; }
+    const ok = await loadDiag();
+    if (ok === false) {
+      crawlState.diag.expanded = true;
+      renderDiag();
+      toast('环境检查有未就绪项，已展开清单', 'warn');
       return false;
     }
     return true;
@@ -113,6 +108,23 @@
   // 统一空状态
   function emptyState(icon, text) {
     return `<div class="empty"><div class="empty__ico">${ico(icon)}</div><p>${esc(text)}</p></div>`;
+  }
+  // 大表格分批补行：首屏只渲染前 first 行，让页面立刻有滚动高度（马上能滚），
+  // 其余行按 chunk 分批异步追加；重绘导致旧 tbody 失效时自动放弃
+  function fillRowsProgressive(tbody, rows, rowHtmlFn, first = 40, chunk = 120) {
+    if (!tbody || !rows || rows.length <= first) return;
+    const rest = rows.slice(first);
+    let i = 0;
+    const step = () => {
+      if (!tbody.isConnected) return;
+      const end = Math.min(i + chunk, rest.length);
+      const t = document.createElement('template');
+      t.innerHTML = rest.slice(i, end).map(rowHtmlFn).join('');
+      tbody.appendChild(t.content);
+      i = end;
+      if (i < rest.length) setTimeout(step, 0);
+    };
+    setTimeout(step, 0);
   }
 
   /* ══════════ 顶部栏 / 安全模式 联动 ══════════ */
@@ -232,9 +244,16 @@
   });
 
   /* ══════════ 弹窗基础设施 ══════════ */
-  function openModal(html) {
+  let modalHideTimer = null;
+
+  function openModal(html, opts) {
     const modal = $('#modal'), bd = $('#modal-backdrop');
+    // 取消上一次关闭遗留的延时隐藏，避免「关掉再立刻打开」被反向隐藏
+    if (modalHideTimer) { clearTimeout(modalHideTimer); modalHideTimer = null; }
     modal.innerHTML = html;
+    // 宽版弹窗：业务画像这类多列表单用（默认 560px 里挤不下）
+    modal.classList.toggle('modal--wide', !!(opts && opts.wide));
+    modal.classList.toggle('modal--biz', !!(opts && opts.variant === 'biz'));
     modal.hidden = false; bd.hidden = false;
     requestAnimationFrame(() => { modal.classList.add('show'); bd.classList.add('show'); });
     $$('[data-close]', modal).forEach((b) => b.addEventListener('click', closeModal));
@@ -244,10 +263,19 @@
   function closeModal() {
     const modal = $('#modal'), bd = $('#modal-backdrop');
     modal.classList.remove('show'); bd.classList.remove('show');
-    setTimeout(() => { modal.hidden = true; bd.hidden = true; }, 220);
+    if (modalHideTimer) clearTimeout(modalHideTimer);
+    modalHideTimer = setTimeout(() => {
+      modal.hidden = true; bd.hidden = true; modalHideTimer = null;
+    }, 220);
     document.removeEventListener('keydown', escClose);
   }
-  function escClose(e) { if (e.key === 'Escape') closeModal(); }
+  function escClose(e) {
+    if (e.key !== 'Escape') return;
+    // 有展开的下拉面板时，Esc 先收面板，不关弹窗（否则一按 Esc 整个表单都没了）
+    const open = document.querySelector('.bdrop.is-open');
+    if (open) { open.classList.remove('is-open'); return; }
+    closeModal();
+  }
 
   /* ══════════ 抽屉基础设施 ══════════ */
   function openDrawer(html) {
@@ -505,6 +533,7 @@
   };
   function route() {
     closeBellPanel();
+    closeModal();   // 切页时收起可能开着的弹窗，避免盖在新页面上
     let hash = (location.hash || '#/workbench').replace('#/', '');
 
     // 旧路由重定向映射
@@ -1126,7 +1155,7 @@
 
 
   /* ═══════════════════════════════════════════
-     视图：评论获客工作台（P3）
+     视图：评论候选池工作台（P3）
      ─ 数字卡 / 风险警示条 / 前端筛选 / 商机表
      ─ 行内流程：生成话术 → 质检 → 人工确认建回复任务
      ─ 固定免责声明；不提供任何批量发送能力
@@ -1150,22 +1179,65 @@
     { key: 'intent', label: '意向', opts: [['all', '全部'], ['A', 'A 级'], ['B', 'B 级'], ['C', 'C 级']] },
     { key: 'sentiment', label: '情绪', opts: [['all', '全部'], ['positive', '正面'], ['neutral', '中性'], ['negative', '负面']] },
     { key: 'category', label: '分类', opts: [['all', '全部'], ['inquiry', '询价'], ['solution', '求方案'], ['pain', '痛点'], ['identity', '决策人'], ['other', '其他']] },
+    // 评论时间：预设区间 + 自定义（右侧两个日期框）。命中口径见 _cgDayKey
+    { key: 'time', label: '评论时间', opts: [['all', '全部'], ['today', '今天'], ['3d', '近 3 天'], ['7d', '近 7 天'], ['30d', '近 30 天'], ['custom', '自定义']] },
   ];
   const _cgInsight = new Map();   // 评论内容 → 分级结果（会话内缓存，避免重复请求）
   const _cgState = {
-    filter: { intent: 'all', sentiment: 'all', category: 'all', status: 'all' },
+    filter: { task: 'all', intent: 'all', sentiment: 'all', category: 'all', status: 'all', time: 'all', timeFrom: '', timeTo: '' },
+    tab: 'all',                   // 候选池拆分：all / unpushed / pushed
     openId: null,                 // 当前展开的行
-    draft: {},                    // taskId → {text, suggestions, guard, notice, busy, created}
+    draft: {},                    // taskId → {text, suggestions, guard, notice, busy, created, pushed}
+    checked: new Set(),           // 勾选待推送的线索 id
+    pushing: false,               // 批量推送中
+    crawlTasks: [],               // 采集任务列表（用于按任务筛选）
+    deleting: false,              // 批量删除中
   };
   function _cgDraft(id) {
     if (!_cgState.draft[id]) {
-      _cgState.draft[id] = { text: '', suggestions: [], guard: null, notice: null, busy: '', created: false };
+      _cgState.draft[id] = { text: '', suggestions: [], guard: null, notice: null, busy: '', created: false, pushed: false };
     }
     return _cgState.draft[id];
   }
   function _cgKeyOf(t) { return String((t && (t.id || t.commentContent)) || ''); }
   function _cgInsightOf(t) { return _cgInsight.get(_cgKeyOf(t)) || null; }
   function _cgIsFallback(ins) { return !!(ins && /兜底/.test(ins.reason || '')); }
+  // 评论时间：采集回来格式很杂 —— unix 秒（10 位）/ 毫秒（13 位）/ 'YYYY-MM-DD' / ISO 串 / 空
+  function _cgParseTime(v) {
+    const raw = String(v || '').trim();
+    if (!raw) return null;
+    if (/^\d{10}$/.test(raw)) return new Date(parseInt(raw, 10) * 1000);
+    if (/^\d{13}$/.test(raw)) return new Date(parseInt(raw, 10));
+    const d = new Date(raw.replace(' ', 'T'));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // 归一到本地日期键 YYYY-MM-DD：时间范围比较靠它，字符串比较即可
+  function _cgDayKey(v) {
+    const d = _cgParseTime(v);
+    if (!d) return '';
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+  function _cgFmtTime(v) {
+    const raw = String(v || '').trim();
+    if (!raw) return '—';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;   // 只有日期，原样显示
+    const d = _cgParseTime(raw);
+    if (!d) return raw;
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  // 列表默认排序：评论时间倒序，最新的在最上面。
+  // 与时间筛选同一口径 —— 评论时间为空时回退采集/创建时间，两者都取不到才沉到末尾，
+  // 否则那批没有评论时间的老数据会一股脑挤在头部。
+  function cgSortKey(t) {
+    const d = _cgParseTime(t && t.commentTime) || _cgParseTime(t && t.createdAt);
+    return d ? d.getTime() : 0;
+  }
+  function sortByCommentTimeDesc(list) {
+    return (list || []).slice().sort((a, b) => cgSortKey(b) - cgSortKey(a));
+  }
+
 
   /* ── 候选池：来自「高意向线索」，不是已有任务 ──
      页面原来读 comment_tasks 当候选，导致候选池 == 任务池：拿旧任务的视频
@@ -1193,6 +1265,12 @@
       replyContent: '',
       createdAt: l.createdAt,
       leadIntentLevel: lv,
+      // v009：完整上下文（评论人 / 评论时间 / 视频 ID），推送后待办互动要直接看到
+      commentAuthor: l.nickname || '',
+      commentTime: l.commentTime || '',
+      videoId: l.videoId || '',
+      // 关联采集任务（用于按任务筛选）
+      sourceTaskId: l.sourceTaskId || l.source_task_id || '',
     };
   }
   // 能进候选池的线索：自家视频评论 + 有评论原文 + 视频地址真实可用
@@ -1245,23 +1323,31 @@
     let risk = null;
     let skipped = { notMine: 0, noComment: 0, badUrl: 0, enqueued: 0 };
     try {
-      // 候选池 = 高意向线索里「还没建过回复任务」的那批。
-      // 已建任务的去「待办互动 → 评论回复」跟进，这里不再重复出现，
-      // 避免拿旧任务（地址常常是占位值）去建出建不出结果的新任务。
-      const [leads, existing] = await Promise.all([
+      // 候选池 = 高意向线索（自家视频评论 + 有评论原文 + 视频地址可用）。
+      // 已推送的线索不再排除：候选池常驻，按「全部 / 未推送 / 已推送」拆分，
+      // 推过去只是建一条评论回复任务，真正的发送仍在「待办互动 → 评论回复」。
+      const [leads, existing, crawlTasksRaw] = await Promise.all([
         API.getLeads(),
         (typeof readTasks === 'function' ? readTasks() : Promise.resolve([])).catch(() => []),
+        (window.CrawlAPI && typeof CrawlAPI.listTasks === 'function')
+          ? CrawlAPI.listTasks().catch(() => [])
+          : Promise.resolve([]),
       ]);
+      // 采集任务按创建时间倒序，用于筛选器
+      _cgState.crawlTasks = (Array.isArray(crawlTasksRaw) ? crawlTasksRaw : [])
+        .slice()
+        .sort((a, b) => new Date(b.created_at || b.createdAt || 0) - new Date(a.created_at || a.createdAt || 0));
       const enqueued = new Set((existing || []).map((t) => t.leadId).filter(Boolean));
       const picked = [];
       (Array.isArray(leads) ? leads : []).forEach((l) => {
         if (!l || l.source !== 'own_comment') { skipped.notMine += 1; return; }
         if (!String(l.comment || '').trim()) { skipped.noComment += 1; return; }
         if (!_cgUsableVideoUrl(l.sourceUrl)) { skipped.badUrl += 1; return; }
-        if (enqueued.has(l.id)) { skipped.enqueued += 1; return; }
         picked.push(l);
       });
       tasks = picked.map(_cgLeadToCandidate);
+      // 标记已推送（已有评论回复任务），用于「全部 / 未推送 / 已推送」拆分
+      tasks.forEach((t) => { if (enqueued.has(t.leadId)) _cgDraft(t.leadId).pushed = true; });
       // 意向等级直接用线索自带的（采集阶段按关键词命中判定），
       // 这样整池的意向不依赖 AI 是否配置
       tasks.forEach((t) => {
@@ -1280,8 +1366,9 @@
 
     main.innerHTML = `
       <div class="view">
-        ${pageHead({ icon: 'dm', title: '评论获客', desc: '从高意向线索挑出待回复评论 → 生成话术 → 质检 → 建回复任务 → 到「待办互动」一键发送',
-          actions: '<button type="button" class="btn btn--ghost btn--sm" id="cg-refresh">刷新</button>' })}
+        ${pageHead({ icon: 'dm', title: '评论候选池', desc: '评论用户池：挑出值得跟进的评论 → 查看详情 → 推送到「待办互动 → 评论回复」写话术并发送',
+          actions: '<button type="button" class="btn btn--ghost btn--sm" id="cg-backfill" title="早期入库的线索没有视频名称，点此按视频 ID 补齐">补齐视频名称</button>' +
+                   '<button type="button" class="btn btn--ghost btn--sm" id="cg-refresh">刷新</button>' })}
         <div id="cg-root" class="cg-body"></div>
         <p class="cg-disclaimer" role="note">${esc(CG_DISCLAIMER)}</p>
       </div>`;
@@ -1289,6 +1376,21 @@
     const root = $('#cg-root');
     const refreshBtn = $('#cg-refresh');
     if (refreshBtn) refreshBtn.addEventListener('click', () => { viewCommentGrowth(params); });
+    const backfillBtn = $('#cg-backfill');
+    if (backfillBtn) backfillBtn.addEventListener('click', async () => {
+      backfillBtn.disabled = true;
+      try {
+        const r = (window.CrawlAPI && typeof CrawlAPI.backfillVideoTitles === 'function')
+          ? await CrawlAPI.backfillVideoTitles() : null;
+        if (!r) { toast('回填接口未加载，请刷新页面重试', 'warn'); return; }
+        toast(`已补齐：线索 ${r.leads_updated || r.leadsUpdated || 0} 条 · 任务 ${r.tasks_updated || r.tasksUpdated || 0} 个`, 'ok');
+        viewCommentGrowth(params);
+      } catch (e) {
+        toast('补齐失败：' + (e.message || e), 'warn');
+      } finally {
+        backfillBtn.disabled = false;
+      }
+    });
 
     let analyzing = false;
 
@@ -1303,8 +1405,8 @@
       if (graded.length) aCount = graded.filter((t) => (_cgInsightOf(t) || {}).intentLevel === 'A').length;
       else if (tasks.some((t) => t.priority)) aCount = tasks.filter((t) => t.priority === 'P0').length;
 
-      // 候选池里每条都还没建任务，所以「待建任务」就是候选总数
-      const pendingCount = tasks.length;
+      // 候选池里每条都还没推送，所以「待推送」就是剩余候选数
+      const pendingCount = tasks.filter((t) => !_cgDraft(t.id).pushed).length;
 
       let negCount = null;
       if (risk && typeof risk.negativeCount === 'number') negCount = risk.negativeCount;
@@ -1314,7 +1416,7 @@
       const cards = [
         { label: '今日新增评论', value: show(todayCount), foot: todayCount === null ? '接口未返回发布时间' : '按线索采集时间统计', mod: '' },
         { label: 'A 级商机', value: show(aCount), foot: aCount === null ? '尚未分级' : '可直接承接（问价 / 要方案）', mod: 'cg-metric--lead' },
-        { label: '待建任务', value: show(pendingCount), foot: '候选池中尚未创建回复任务的线索', mod: '' },
+        { label: '待推送', value: show(pendingCount), foot: '候选池中尚未推送到待办互动的线索', mod: '' },
         { label: '⚠ 负面评论', value: show(negCount), foot: '情绪判定为负面的评论', mod: 'cg-metric--danger' },
       ];
       return `<div class="cg-metrics">${cards.map((c) => `
@@ -1343,16 +1445,74 @@
     }
 
     /* ── ③ 筛选栏（纯前端过滤，不重复请求后端） ── */
+    // 时间预设 → [起, 止]（YYYY-MM-DD，含当天）：近 N 天 = 今天往前数 N 天
+    function cgTimeRange() {
+      const f = _cgState.filter;
+      const DAY = 86400000;
+      const key = (d) => {
+        const p = (n) => String(n).padStart(2, '0');
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+      };
+      const today = new Date();
+      const back = (n) => key(new Date(today.getTime() - n * DAY));
+      switch (f.time) {
+        case 'today':  return [key(today), key(today)];
+        case '3d':     return [back(2), key(today)];
+        case '7d':     return [back(6), key(today)];
+        case '30d':    return [back(29), key(today)];
+        case 'custom': return [f.timeFrom || '', f.timeTo || ''];
+        default:       return ['', ''];
+      }
+    }
+    function cgFilterActive() {
+      const f = _cgState.filter;
+      return f.task !== 'all' || f.intent !== 'all' || f.sentiment !== 'all' || f.category !== 'all' || f.status !== 'all'
+        || f.time !== 'all' || !!f.timeFrom || !!f.timeTo;
+    }
+    // 换筛选 / 换页签 / 改时间区间 = 换视图，已选一律清空。
+    // 不清的话勾选集会跟着跑到别的筛选下，出现「筛了 B 级，已选却还是 622」。
+    function cgClearChecked() { _cgState.checked.clear(); }
+
     function filterHtml() {
-      return `<div class="filter-bar cg-filter">
-        ${CG_FILTERS.map((f) => `
-          <span class="cg-filter__group">
-            <span class="cg-filter__label">${esc(f.label)}</span>
-            ${f.opts.map(([v, l]) => `<button type="button" class="filter-chip" data-cg-f="${f.key}" data-cg-fv="${v}"
-              aria-pressed="${_cgState.filter[f.key] === v ? 'true' : 'false'}">${esc(l)}</button>`).join('')}
-          </span>`).join('')}
+      const f = _cgState.filter;
+      // 统一的下拉列表样式
+      const selectStyle = 'padding:3px 8px;border:1px solid #d8d8de;border-radius:6px;font-size:12px;background:#fff;max-width:160px';
+      // 采集任务筛选器：选项来自 crawlTasks，按创建时间倒序
+      const taskOpts = [['all', '全部任务']];
+      (_cgState.crawlTasks || []).forEach((t) => {
+        if (t && t.id) taskOpts.push([String(t.id), t.name || ('任务 ' + String(t.id).slice(0, 8))]);
+      });
+      // 通用下拉列表渲染
+      const renderSelect = (key, label, opts, title) => `<span class="cg-filter__group" style="display:flex;align-items:center;gap:6px">
+        <span class="cg-filter__label"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</span>
+        <select class="cg-filter-select" data-cg-filter-select="${esc(key)}" aria-label="${esc(label)}筛选" style="${selectStyle}">
+          ${opts.map(([v, l]) => `<option value="${esc(v)}" ${f[key] === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+        </select>
+      </span>`;
+      // 评论时间：选"自定义"时显示日期范围
+      const timeSelect = renderSelect('time', '评论时间', CG_FILTERS.find((g) => g.key === 'time').opts, '按评论发布时间筛；该条评论没有评论时间时按采集时间计');
+      const timeRange = f.time === 'custom' ? `<span class="cg-filter__range" style="display:flex;align-items:center;gap:4px">
+        <input type="date" class="cg-date" data-cg-t="from" value="${esc(f.timeFrom || '')}" aria-label="评论时间起" style="padding:2px 4px;border:1px solid #d8d8de;border-radius:4px;font-size:11px">
+        <span class="cg-filter__tilde">至</span>
+        <input type="date" class="cg-date" data-cg-t="to" value="${esc(f.timeTo || '')}" aria-label="评论时间止" style="padding:2px 4px;border:1px solid #d8d8de;border-radius:4px;font-size:11px">
+      </span>` : '';
+      // 全部/未推送/已推送 页签计数
+      const unpushedN = tasks.filter((t) => !_cgDraft(t.id).pushed).length;
+      const pushedN = tasks.length - unpushedN;
+      const tabBtn = (key, label, count) => `<button type="button" class="cg-tab" data-cg-tab="${key}"
+        style="margin-left:6px;border:1px solid #d8d8de;background:${_cgState.tab===key?'#2b6cff':'transparent'};color:${_cgState.tab===key?'#fff':'#333'};padding:3px 11px;border-radius:999px;cursor:pointer;font-size:12px">${label} ${fmt(count)}</button>`;
+      return `<div class="filter-bar cg-filter" style="flex-wrap:nowrap;white-space:nowrap;overflow-x:auto">
+        ${renderSelect('task', '采集任务', taskOpts, '按采集评论时创建的任务筛选')}
+        ${CG_FILTERS.filter((g) => g.key !== 'time').map((g) => renderSelect(g.key, g.label, g.opts)).join('')}
+        ${timeSelect}
+        ${timeRange}
+        <span style="margin-left:12px;display:flex;align-items:center">
+          ${tabBtn('all', '全部', tasks.length)}
+          ${tabBtn('unpushed', '未推送', unpushedN)}
+          ${tabBtn('pushed', '已推送', pushedN)}
+        </span>
         <span class="cg-filter__spacer"></span>
-        ${Object.keys(_cgState.filter).some((k) => _cgState.filter[k] !== 'all')
+        ${cgFilterActive()
           ? '<button type="button" class="btn-link" data-cg-freset="1">清空筛选</button>' : ''}
         ${analyzing ? '<span class="muted cg-filter__hint">正在逐条分级…</span>' : ''}
       </div>`;
@@ -1360,69 +1520,59 @@
 
     function filteredTasks() {
       const f = _cgState.filter;
-      return tasks.filter((t) => {
+      const tab = _cgState.tab || 'all';
+      const [from, to] = cgTimeRange();
+      const list = tasks.filter((t) => {
+        const pushed = _cgDraft(t.id).pushed;
+        if (tab === 'unpushed' && pushed) return false;
+        if (tab === 'pushed' && !pushed) return false;
+        // 按采集任务筛选：sourceTaskId 匹配当前选中的任务 ID
+        if (f.task !== 'all' && String(t.sourceTaskId || '') !== String(f.task)) return false;
         const ins = _cgInsightOf(t) || {};
         if (f.intent !== 'all' && (ins.intentLevel || 'C') !== f.intent) return false;
         if (f.sentiment !== 'all' && (ins.sentiment || 'neutral') !== f.sentiment) return false;
         if (f.category !== 'all' && (ins.category || 'other') !== f.category) return false;
         if (f.status !== 'all' && t.status !== f.status) return false;
+        if (from || to) {
+          // 评论时间缺失时退回采集时间，避免老线索在筛时间时凭空消失
+          const day = _cgDayKey(t.commentTime) || _cgDayKey(t.createdAt);
+          if (!day) return false;
+          if (from && day < from) return false;
+          if (to && day > to) return false;
+        }
         return true;
       });
+      // 默认排序：评论时间倒序（最新在最上）
+      return sortByCommentTimeDesc(list);
     }
 
     /* ── ④⑤ 商机表 + 行内展开处理 ── */
     function detailHtml(t) {
       const d = _cgDraft(t.id);
       const ins = _cgInsightOf(t) || {};
-      const blocked = !!(d.guard && d.guard.pass === false);
-      const noLead = !t.leadId;
-      const hasText = !!String(d.text || '').trim();
-      const canCreate = hasText && !blocked && !noLead && !d.created;
-      const sugs = d.suggestions.length ? `<div class="cg-sugs">${d.suggestions.map((s, i) => `
-        <button type="button" class="cg-sug ${d.text === s.content ? 'cg-sug--on' : ''}" data-cg-sug="${esc(t.id)}" data-cg-sug-idx="${i}">
-          <span class="cg-sug__type">${esc(s.label || s.type || ('候选 ' + (i + 1)))}</span>
-          <span class="cg-sug__text">${esc(s.content || '')}</span>
-        </button>`).join('')}</div>` : '';
-      const hits = (d.guard && d.guard.hits) || [];
-      const hitsHtml = hits.length ? `<ul class="cg-hits">${hits.map((h) => `
-        <li class="cg-hit cg-hit--${h.severity === 'block' ? 'block' : 'warn'}">
-          <span class="cg-hit__tag">${h.severity === 'block' ? '禁止' : '提示'}</span>
-          <span class="cg-hit__cat">${esc(h.category || '未分类')}${h.ruleCode ? `<span class="cg-hit__code">${esc(h.ruleCode)}</span>` : ''}</span>
-          <span class="cg-hit__matched">命中「${esc(h.matched || '')}」</span>
-          ${h.advice ? `<span class="cg-hit__advice">建议：${esc(h.advice)}</span>` : ''}
-        </li>`).join('')}</ul>` : '';
-      const guardHtml = d.guard ? `<div class="cg-guardresult">
-          <span class="tag ${d.guard.pass ? 'tag--healthy' : 'tag--failed'}">${d.guard.pass ? '质检通过' : '未通过'}</span>
-          <span class="muted">禁止 ${fmt(d.guard.blockCount || 0)} · 提示 ${fmt(d.guard.warnCount || 0)}</span>
-          ${d.guard.sensitiveCheckAvailable === false ? '<span class="muted">（敏感词库不可用，本次仅执行话术套路检查）</span>' : ''}
-          ${(d.guard.sanitized && d.guard.sanitized !== d.text) ? `<div class="cg-sanitized">脱敏建议：${esc(d.guard.sanitized)}</div>` : ''}
-        </div>${hitsHtml}` : '';
-      const noticeHtml = d.notice ? `<div class="cg-notice cg-notice--${d.notice.type}">${esc(d.notice.text)}</div>` : '';
+      const canPush = !d.pushed && !d.busy;
+      const videoLabel = t.videoTitle || (t.videoId ? ('视频 ' + t.videoId) : '未知视频');
       const fallbackHtml = _cgIsFallback(ins)
         ? '<div class="cg-notice cg-notice--warn">AI 未配置或不可用，当前分级为兜底值（其他 / C 级），配置 API Key 后可获得真实分级。</div>' : '';
-      const tip = blocked ? '话术未通过质检，禁止建任务'
-        : noLead ? '该评论缺少关联线索 ID'
-        : d.created ? '已创建回复任务' : '回复必须人工确认后逐条发送，本页不提供批量发送';
+      const tip = d.pushed
+        ? '已推送到「待办互动 → 评论回复」'
+        : '推送后到「待办互动 → 评论回复」写话术并发送；本页只做筛选，不发送';
       return `<tr class="cg-detail"><td colspan="7"><div class="cg-detail__inner">
         <div class="cg-detail__meta">
-          <span>🎬 来源视频：${esc(t.videoTitle || '未知')}</span>
-          <span>👤 负责账号：${esc(t.account || '—')}</span>
+          <span>👤 评论人：${esc(t.commentAuthor || '未知')}</span>
+          <span>🎬 视频名称：${esc(videoLabel)}${t.videoUrl ? ` <a href="${esc(t.videoUrl)}" target="_blank" rel="noopener">打开视频↗</a>` : ''}</span>
+          <span>🆔 视频 ID：${esc(t.videoId || '—')}</span>
+          <span>🕒 评论时间：${esc(_cgFmtTime(t.commentTime))}</span>
+          <span>📱 评论账号：${esc(t.account || '—')}</span>
           <span>🏷 优先度：${esc(t.priority || '—')}</span>
           <span>🔗 关联线索：${esc(t.leadId || '—')}</span>
           ${ins.reason ? `<span class="muted">分级依据：${esc(ins.reason)}</span>` : ''}
         </div>
         ${fallbackHtml}
         <div class="cg-detail__actions">
-          <button type="button" class="btn btn--sm" data-cg-gen="${esc(t.id)}" ${d.busy ? 'disabled' : ''}>${d.busy === 'gen' ? '生成中…' : '生成话术'}</button>
-          <button type="button" class="btn btn--sm" data-cg-guard="${esc(t.id)}" ${d.busy ? 'disabled' : ''}>${d.busy === 'guard' ? '质检中…' : '质检'}</button>
-          <button type="button" class="btn btn--primary btn--sm" data-cg-create="${esc(t.id)}" ${(canCreate && !d.busy) ? '' : 'disabled'} title="${esc(tip)}">${d.created ? '已建任务' : (d.busy === 'create' ? '提交中…' : '建回复任务')}</button>
+          <button type="button" class="btn btn--primary btn--sm" data-cg-push="${esc(t.id)}" ${(canPush && !d.busy) ? '' : 'disabled'} title="${esc(tip)}">${d.pushed ? '已推送' : (d.busy === 'push' ? '推送中…' : '推送到待办互动')}</button>
           <span class="muted cg-detail__hint">${esc(tip)}</span>
         </div>
-        ${sugs}
-        <textarea class="cg-text" data-cg-text="${esc(t.id)}" rows="3"
-          placeholder="点选上方候选话术，或在此手写话术；随后点「质检」再建任务">${esc(d.text)}</textarea>
-        ${noticeHtml}
-        ${guardHtml}
       </div></td></tr>`;
     }
 
@@ -1434,176 +1584,193 @@
       const isOpen = _cgState.openId === t.id;
       const isNeg = ins.sentiment === 'negative';
       const d = _cgState.draft[t.id];
-      const brief = d && d.text ? d.text : (t.replyContent || '');
-      const guardTag = (d && d.guard)
-        ? (d.guard.pass ? '<span class="tag tag--healthy">通过</span>' : '<span class="tag tag--failed">未通过</span>')
-        : '<span class="muted">未质检</span>';
-      return `<tr class="cg-row ${isNeg ? 'row--danger' : ''} ${isOpen ? 'cg-row--open' : ''}" data-cg-select="${esc(t.id)}" title="点击展开处理">
+      const checked = _cgState.checked.has(t.id);
+      const videoLabel = t.videoTitle || (t.videoId ? ('视频 ' + t.videoId) : '未知视频');
+      return `<tr class="cg-row ${isNeg ? 'row--danger' : ''} ${isOpen ? 'cg-row--open' : ''}" data-cg-select="${esc(t.id)}" title="点击展开详情">
+        <td style="width:36px"><input type="checkbox" data-cg-check="${esc(t.id)}" ${checked ? 'checked' : ''} aria-label="选择这条线索"></td>
+        <td style="width:104px">
+          <div style="font-weight:600;font-size:12.5px">${esc(t.commentAuthor || '未知')}</div>
+          <div class="muted" style="font-size:11px">${esc(_cgFmtTime(t.commentTime))}</div>
+        </td>
         <td>
           <div class="cg-row__comment">${esc(t.commentContent || '(无评论内容)')}</div>
-          <div class="cg-row__sub">🎬 ${esc(t.videoTitle || '未知视频')}</div>
+          <div class="cg-row__sub">🎬 ${esc(videoLabel)}${t.videoUrl ? ` · <a href="${esc(t.videoUrl)}" target="_blank" rel="noopener" data-cg-stop="1">打开视频↗</a>` : ''}</div>
         </td>
         <td><span class="tag tag--${cat.cls}">${esc(cat.label)}</span></td>
         <td><span class="cg-lv cg-lv--${lv.toLowerCase()}">${esc(lv)}</span></td>
         <td><span class="tag tag--${sen.cls}">${esc(sen.label)}</span></td>
-        <td><div class="cg-row__script">${brief ? esc(brief) : '<span class="muted">—</span>'}</div></td>
-        <td>${guardTag}</td>
-        <td style="text-align:right;white-space:nowrap"><span class="btn-link">${isOpen ? '收起' : '处理'}</span></td>
+        <td style="text-align:right;white-space:nowrap">
+          <button type="button" class="btn btn--primary btn--sm" data-cg-push="${esc(t.id)}" ${(d && (d.pushed || d.busy)) ? 'disabled' : ''}>${(d && d.pushed) ? '已推送' : '推送'}</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-cg-delete="${esc(t.id)}" title="删除这条线索" style="margin-left:4px;color:var(--danger);border-color:var(--danger)">删除</button>
+          <span class="btn-link">${isOpen ? '收起' : '详情'}</span>
+        </td>
       </tr>${isOpen ? detailHtml(t) : ''}`;
     }
 
     function tableHtml() {
       const list = filteredTasks();
-      const skippedTotal = skipped.notMine + skipped.noComment + skipped.badUrl + skipped.enqueued;
-      const skippedTip = `已建任务 ${skipped.enqueued} · 视频地址不可用 ${skipped.badUrl} · 无评论原文 ${skipped.noComment} · 非自家视频 ${skipped.notMine}`;
+      const skippedTotal = skipped.notMine + skipped.noComment + skipped.badUrl;
+      const skippedTip = `视频地址不可用 ${skipped.badUrl} · 无评论原文 ${skipped.noComment} · 非自家视频 ${skipped.notMine}`;
+      const allChecked = list.length > 0 && list.every((t) => _cgState.checked.has(t.id));
+      // 已选只数当前筛选/页签内的：换视图会清空，这里再兜一次，防数据刷新后残留
+      const checkedCount = list.filter((t) => _cgState.checked.has(t.id)).length;
       return `<div class="card cg-tablecard">
         <div class="card__head">
-          <span class="card__title">待建任务的评论商机</span>
-          <span class="card__hint">候选来自「高意向线索」；已建过任务的去「待办互动 → 评论回复」处理</span>
+          <span class="card__title">评论候选池</span>
+          <span class="card__hint">本页只做筛选与推送，回复在「待办互动 → 评论回复」</span>
           <span class="card__spacer"></span>
           ${skippedTotal ? `<span class="tag" title="${esc(skippedTip)}">已排除 ${fmt(skippedTotal)} 条</span>` : ''}
-          <span class="tag tag--pending">待建任务 ${fmt(tasks.length)}</span>
+          <span class="tag tag--pending">候选 ${fmt(list.length)}</span>
           <span class="tag tag--collected" style="margin-left:4px">筛出 ${fmt(list.length)} / ${fmt(tasks.length)}</span>
         </div>
         ${loadError ? `<div class="cg-notice cg-notice--warn">评论任务加载失败：${esc(loadError)}。请确认后端服务已启动。</div>` : ''}
-        ${list.length ? `<div class="table-wrap"><table class="data cg-table">
+        ${list.length ? `<div class="cg-batchbar">
+          <label class="cg-checkall" data-cg-checkall="1"><input type="checkbox" ${allChecked ? 'checked' : ''}> 全选本页</label>
+          <span class="muted">已选 ${fmt(checkedCount)} 条</span>
+          <span style="flex:1"></span>
+          <button type="button" class="btn btn--sm btn--ghost" data-cg-delete-batch="1" ${(checkedCount && !_cgState.deleting) ? '' : 'disabled'} style="color:var(--danger);border-color:var(--danger)">
+            ${_cgState.deleting ? '删除中…' : `删除选中 (${fmt(checkedCount)})`}
+          </button>
+          <button type="button" class="btn btn--primary btn--sm" data-cg-push-batch="1" ${(checkedCount && !_cgState.pushing) ? '' : 'disabled'}>
+            ${_cgState.pushing ? '推送中…' : `推送到待办互动 (${fmt(checkedCount)})`}
+          </button>
+        </div>
+        <div class="table-wrap"><table class="data cg-table">
           <thead><tr>
-            <th>评论 / 来源视频</th>
-            <th style="width:96px">分类</th>
-            <th style="width:72px">意向</th>
+            <th style="width:36px"></th>
+            <th style="width:104px">评论人</th>
+            <th>评论内容 / 来源视频</th>
+            <th style="width:88px">分类</th>
+            <th style="width:64px">意向</th>
             <th style="width:72px">情绪</th>
-            <th style="width:220px">建议话术</th>
-            <th style="width:92px">质检</th>
-            <th style="width:88px;text-align:right">操作</th>
+            <th style="width:120px;text-align:right">操作</th>
           </tr></thead>
-          <tbody>${list.map(rowHtml).join('')}</tbody>
+          <tbody data-cg-tbody="1">${list.slice(0, 40).map(rowHtml).join('')}</tbody>
         </table></div>` : emptyState('empty', tasks.length
           ? '当前筛选条件下没有匹配的评论'
-          : '暂无可建任务的评论。候选池只收「自家视频评论 + 有评论原文 + 视频地址真实可用 + 未建过任务」的线索，可先到「采集评论」按高意向关键词采集。')}
+          : '暂无候选评论。候选池收「自家视频评论 + 有评论原文 + 视频地址真实可用」的线索；已推送的仍在「已推送」页签，可先到「采集评论」按高意向关键词采集。')}
       </div>`;
     }
 
     function paint() {
+      const list = filteredTasks();
       root.innerHTML = metricsHtml() + riskHtml() + filterHtml() + tableHtml();
+      fillRowsProgressive(root.querySelector('[data-cg-tbody]'), list, rowHtml);
     }
 
     /* ── 行内动作实现 ── */
-    function _readTextarea(id) {
-      const d = _cgDraft(id);
-      const ta = root.querySelector('[data-cg-text="' + id + '"]');
-      if (ta) d.text = ta.value;
-      return d;
-    }
-    async function cgGen(id) {
+    async function cgPush(id) {
       const t = tasks.find((x) => x.id === id);
       if (!t) return;
       const d = _cgDraft(id);
-      if (typeof API.commentSuggestion !== 'function') {
-        d.notice = { type: 'warn', text: '生成话术接口未加载，请刷新页面重试。' };
+      if (!t.leadId) {
+        d.notice = { type: 'warn', text: '该评论缺少关联线索 ID，无法推送，请先到「筛选高意向」补全线索。' };
         paint();
         return;
       }
-      d.busy = 'gen';
+      if (typeof API.pushCommentTasks !== 'function') {
+        d.notice = { type: 'warn', text: '推送接口未加载，请刷新页面重试。' };
+        paint();
+        return;
+      }
+      d.busy = 'push';
       d.notice = null;
       paint();
       try {
-        const ins = _cgInsightOf(t) || {};
-        const scenario = CG_SCENARIO_OF[ins.replyType] || 'auto';
-        const res = await API.commentSuggestion({
-          comment: t.commentContent || '',
-          videoTitle: t.videoTitle || '',
-          scenario: scenario,
+        const res = await API.pushCommentTasks([t.leadId], {
+          account: t.account || undefined,
+          priority: t.priority || undefined,
         });
-        d.suggestions = (res && res.suggestions) || [];
-        if (!d.suggestions.length) {
-          d.notice = { type: 'warn', text: 'AI 未返回候选话术，请稍后重试或直接手写话术。' };
-        } else if (!String(d.text || '').trim()) {
-          d.text = d.suggestions[0].content || '';
+        if (!res || !res.created) {
+          const item = ((res && res.items) || []).find((i) => i.leadId === t.leadId) || {};
+          d.notice = { type: 'warn', text: '未推送：' + (item.reason || '该线索已在待办互动中') };
+        } else {
+          d.pushed = true;
+          d.created = true;
+          _cgState.checked.delete(t.id);
+          d.notice = { type: 'ok', text: `已推送到「待办互动 → 评论回复」（任务 ${(res.taskIds || [])[0] || '已创建'}），到那边写话术后发送。` };
+          toast('已推送到「待办互动 → 评论回复」', 'ok');
         }
       } catch (e) {
-        d.suggestions = [];
-        d.notice = (e && e.status === 503)
-          ? { type: 'warn', text: 'AI 服务未配置，请先在「系统设置」页填写 API Key 后再生成话术。' }
-          : { type: 'warn', text: '生成话术失败：' + (e.message || e) };
+        d.notice = { type: 'warn', text: '推送失败：' + (e.message || e) };
       } finally {
         d.busy = '';
         paint();
       }
     }
-    async function cgGuard(id) {
-      const t = tasks.find((x) => x.id === id);
-      if (!t) return;
-      const d = _readTextarea(id);
-      if (!String(d.text || '').trim()) {
-        d.notice = { type: 'warn', text: '请先点选候选话术或手写话术，再进行质检。' };
-        paint();
+
+    async function cgPushBatch() {
+      // 只推当前筛选/页签内勾选的：否则会出现「筛了 B 级却把整池 622 条推过去」
+      const visible = filteredTasks();
+      const ids = visible.map((t) => t.id).filter((id) => _cgState.checked.has(id));
+      if (!ids.length) return;
+      if (typeof API.pushCommentTasks !== 'function') {
+        toast('推送接口未加载，请刷新页面重试', 'warn');
         return;
       }
-      if (typeof API.guardCheck !== 'function') {
-        d.notice = { type: 'warn', text: '质检接口未加载，请刷新页面重试。' };
-        paint();
-        return;
-      }
-      d.busy = 'guard';
-      d.notice = null;
+      _cgState.pushing = true;
       paint();
       try {
-        d.guard = await API.guardCheck(d.text, t.account || undefined);
-      } catch (e) {
-        d.guard = null;
-        d.notice = { type: 'warn', text: '质检失败：' + (e.message || e) };
-      } finally {
-        d.busy = '';
-        paint();
-      }
-    }
-    async function cgCreate(id) {
-      const t = tasks.find((x) => x.id === id);
-      if (!t) return;
-      const d = _readTextarea(id);
-      if (d.guard && d.guard.pass === false) {
-        d.notice = { type: 'warn', text: '话术未通过质检，禁止建回复任务。请修改话术后重新质检。' };
-        paint();
-        return;
-      }
-      if (!t.leadId) {
-        d.notice = { type: 'warn', text: '该评论缺少关联线索 ID，无法自动建任务，请先到「筛选高意向」补全线索。' };
-        paint();
-        return;
-      }
-      if (!String(d.text || '').trim()) {
-        d.notice = { type: 'warn', text: '请先填写话术。' };
-        paint();
-        return;
-      }
-      if (typeof API.createCommentGrowthTask !== 'function') {
-        d.notice = { type: 'warn', text: '建任务接口未加载，请刷新页面重试。' };
-        paint();
-        return;
-      }
-      d.busy = 'create';
-      d.notice = null;
-      paint();
-      try {
-        const res = await API.createCommentGrowthTask({
-          leadId: t.leadId,
-          commentContent: t.commentContent,
-          videoTitle: t.videoTitle,
-          videoUrl: t.videoUrl,
-          commentId: t.commentId,
-          account: t.account,
-          priority: t.priority || 'P2',
-          replyContent: d.text,
+        const res = await API.pushCommentTasks(ids);
+        const createdIds = new Set(((res && res.items) || []).filter((i) => i.status === 'created').map((i) => i.leadId));
+        createdIds.forEach((id) => {
+          const d = _cgDraft(id);
+          d.pushed = true;
+          d.created = true;
         });
-        d.created = true;
-        d.notice = { type: 'ok', text: '回复任务已创建（' + ((res && res.id) || '成功') + '），请到「待办互动 → 评论回复」人工确认后发送。' };
-        toast('已创建评论回复任务，请人工确认后逐条发送');
+        _cgState.checked.clear();
+        toast(
+          `已推送 ${res.created || 0} 条到「待办互动 → 评论回复」` + (res.skipped ? `，跳过 ${res.skipped} 条（已在待办中）` : ''),
+          (res.created ? 'ok' : 'warn'),
+        );
       } catch (e) {
-        d.notice = { type: 'warn', text: '创建任务失败：' + (e.message || e) };
+        toast('批量推送失败：' + (e.message || e), 'warn');
       } finally {
-        d.busy = '';
+        _cgState.pushing = false;
         paint();
       }
+    }
+
+    /* ── 删除单条线索 ── */
+    async function cgDelete(id) {
+      const t = tasks.find((x) => x.id === id);
+      if (!t) return;
+      if (!confirm(`确定删除这条评论线索吗？\n\n评论人：${t.commentAuthor || '未知'}\n评论：${(t.commentContent || '').slice(0, 50)}\n\n删除后不可恢复。`)) return;
+      try {
+        await API.deleteLead(id);
+        tasks = tasks.filter((x) => x.id !== id);
+        _cgState.checked.delete(id);
+        delete _cgState.draft[id];
+        toast('已删除', 'ok');
+        paint();
+      } catch (e) {
+        toast('删除失败：' + (e.message || e), 'warn');
+      }
+    }
+
+    /* ── 批量删除线索 ── */
+    async function cgDeleteBatch() {
+      const visible = filteredTasks();
+      const ids = visible.map((t) => t.id).filter((id) => _cgState.checked.has(id));
+      if (!ids.length) return;
+      if (!confirm(`确定删除选中的 ${ids.length} 条评论线索吗？删除后不可恢复。`)) return;
+      _cgState.deleting = true;
+      paint();
+      let ok = 0, fail = 0;
+      for (const id of ids) {
+        try {
+          await API.deleteLead(id);
+          tasks = tasks.filter((x) => x.id !== id);
+          _cgState.checked.delete(id);
+          delete _cgState.draft[id];
+          ok += 1;
+        } catch (e) {
+          fail += 1;
+        }
+      }
+      _cgState.deleting = false;
+      toast(`已删除 ${ok} 条` + (fail ? `，失败 ${fail} 条` : ''), ok ? 'ok' : 'warn');
+      paint();
     }
 
     root.addEventListener('click', (ev) => {
@@ -1611,12 +1778,25 @@
       if (!el) return;
       const f = el.closest('[data-cg-f]');
       if (f) {
-        _cgState.filter[f.dataset.cgF] = f.dataset.cgFv;
+        const key = f.dataset.cgF;
+        const val = f.dataset.cgFv;
+        _cgState.filter[key] = val;
+        // 切到非自定义区间时清掉手填的起止，否则预设选了也不生效
+        if (key === 'time' && val !== 'custom') { _cgState.filter.timeFrom = ''; _cgState.filter.timeTo = ''; }
+        cgClearChecked();
+        paint();
+        return;
+      }
+      const tabBtn = el.closest('[data-cg-tab]');
+      if (tabBtn) {
+        _cgState.tab = tabBtn.dataset.cgTab;
+        cgClearChecked();
         paint();
         return;
       }
       if (el.closest('[data-cg-freset]')) {
-        _cgState.filter = { intent: 'all', sentiment: 'all', category: 'all', status: 'all' };
+        _cgState.filter = { task: 'all', intent: 'all', sentiment: 'all', category: 'all', status: 'all', time: 'all', timeFrom: '', timeTo: '' };
+        cgClearChecked();
         paint();
         return;
       }
@@ -1629,12 +1809,33 @@
         if (item) { dd.text = item.content || ''; paint(); }
         return;
       }
-      const gen = el.closest('[data-cg-gen]');
-      if (gen) { cgGen(gen.dataset.cgGen); return; }
-      const grd = el.closest('[data-cg-guard]');
-      if (grd) { cgGuard(grd.dataset.cgGuard); return; }
-      const crt = el.closest('[data-cg-create]');
-      if (crt) { cgCreate(crt.dataset.cgCreate); return; }
+      // 视频链接：点在链接上不触发展开
+      if (el.closest('[data-cg-stop]')) return;
+      const chkAll = el.closest('[data-cg-checkall]');
+      if (chkAll) {
+        // 目标状态按自身状态推导，不读 DOM 的 checked —— 点 label 文字时浏览器的
+        // 默认切换发生在事件派发之后，此刻读到的还是旧值，会反着来
+        const list = filteredTasks();
+        const allOn = list.length > 0 && list.every((t) => _cgState.checked.has(t.id));
+        list.forEach((t) => { if (allOn) _cgState.checked.delete(t.id); else _cgState.checked.add(t.id); });
+        paint();
+        return;
+      }
+      const chk = el.closest('[data-cg-check]');
+      if (chk) {
+        const id = chk.dataset.cgCheck;
+        if (_cgState.checked.has(id)) _cgState.checked.delete(id); else _cgState.checked.add(id);
+        paint();
+        return;
+      }
+      const batch = el.closest('[data-cg-push-batch]');
+      if (batch) { cgPushBatch(); return; }
+      const delBatch = el.closest('[data-cg-delete-batch]');
+      if (delBatch) { cgDeleteBatch(); return; }
+      const push = el.closest('[data-cg-push]');
+      if (push) { cgPush(push.dataset.cgPush); return; }
+      const del = el.closest('[data-cg-delete]');
+      if (del) { cgDelete(del.dataset.cgDelete); return; }
       const sel = el.closest('[data-cg-select]');
       if (sel) {
         const id = sel.dataset.cgSelect;
@@ -1642,13 +1843,31 @@
         paint();
       }
     });
-    // 手写话术：只更新状态不重绘，避免输入时光标跳动
-    root.addEventListener('input', (ev) => {
-      const el = (ev.target && ev.target.getAttribute) ? ev.target : null;
-      if (!el) return;
-      const id = el.getAttribute('data-cg-text');
-      if (!id) return;
-      _cgDraft(id).text = el.value;
+
+    // 统一处理所有下拉筛选器 + 自定义时间范围
+    root.addEventListener('change', (ev) => {
+      const el = ev.target;
+      if (!el || !el.dataset) return;
+      // 通用下拉筛选（采集任务 / 意向 / 情绪 / 分类 / 评论时间）
+      if (el.dataset.cgFilterSelect !== undefined) {
+        const key = el.dataset.cgFilterSelect;
+        _cgState.filter[key] = el.value || 'all';
+        // 切到非自定义区间时清掉手填的起止
+        if (key === 'time' && el.value !== 'custom') {
+          _cgState.filter.timeFrom = '';
+          _cgState.filter.timeTo = '';
+        }
+        cgClearChecked();
+        paint();
+        return;
+      }
+      // 自定义日期范围输入
+      if (!el.dataset.cgT) return;
+      if (el.dataset.cgT === 'from') _cgState.filter.timeFrom = el.value || '';
+      else _cgState.filter.timeTo = el.value || '';
+      _cgState.filter.time = (_cgState.filter.timeFrom || _cgState.filter.timeTo) ? 'custom' : 'all';
+      cgClearChecked();
+      paint();
     });
 
     paint();
@@ -1680,8 +1899,8 @@
     const tab = params.get('tab') || 'comments';
     const tabs = [
       { key: 'comments', label: '评论回复', desc: '已分级评论，待落地回复' },
-      { key: 'inbox', label: '私信收件箱', desc: '用户主动私信待承接' },
-      { key: 'dm', label: '私信任务', desc: '主动私信待发送' },
+      { key: 'inbox', label: '用户私信（收件箱）', desc: '对方先发来的，待承接回复' },
+      { key: 'dm', label: '主动私信（发送队列）', desc: '我们主动去找线索发' },
     ];
 
     // 待办数量：口径必须与各 Tab 内实际列表一致，否则卡片数字会对不上列表
@@ -1689,6 +1908,10 @@
     //   inbox    → 待承接会话（新会话，或存在未读消息）
     //   dm       → 待发送私信（队列状态为 pending_outreach）
     let counts = { comments: 0, inbox: 0, dm: 0 };
+    // 顺手缓存这三个全量结果，供下面的 Tab 渲染直接复用：
+    // 否则同一个 /api/comments/tasks（60 万字节）会被「卡片计数」和「列表渲染」各拉一遍，
+    // 而且是串行（先等计数完、再发第二次），实测白等 ~330ms。
+    const prefetched = { comments: null, dm: null, inbox: null };
     try {
       const [commentRes, dmRes, inboxRes] = await Promise.all([
         (typeof API.getCommentTasks === 'function' ? API.getCommentTasks() : Promise.resolve([])).catch(() => []),
@@ -1697,9 +1920,12 @@
       ]);
       // 三个接口均返回顶层数组，这里同时兼容 { items: [] } 包装
       const toArr = (r) => (Array.isArray(r) ? r : ((r && r.items) || []));
-      counts.comments = toArr(commentRes).filter((t) => t.status === 'pending' || t.status === 'failed').length;
-      counts.dm = toArr(dmRes).filter((q) => q.status === 'pending_outreach').length;
-      counts.inbox = toArr(inboxRes).filter((c) => c.status === 'new' || (c.unreadCount || 0) > 0).length;
+      prefetched.comments = toArr(commentRes);
+      prefetched.dm = toArr(dmRes);
+      prefetched.inbox = toArr(inboxRes);
+      counts.comments = prefetched.comments.filter((t) => t.status === 'pending' || t.status === 'failed').length;
+      counts.dm = prefetched.dm.filter((q) => q.status === 'pending_outreach').length;
+      counts.inbox = prefetched.inbox.filter((c) => c.status === 'new' || (c.unreadCount || 0) > 0).length;
     } catch (e) { /* 统计失败不影响主流程 */ }
 
     main.innerHTML = `
@@ -1735,20 +1961,21 @@
 
     // 渲染对应Tab内容（由 route() 携带新的 tab 参数重新调用本函数）
     const content = $('#interact-content');
-    if (tab === 'inbox') await renderInboxTab(content);
-    else if (tab === 'comments') await renderCommentsTab(content);
-    else await renderDmTab(content);
+    if (tab === 'inbox') await renderInboxTab(content, prefetched);
+    else if (tab === 'comments') await renderCommentsTab(content, prefetched);
+    else await renderDmTab(content, prefetched);
   }
 
   /* ═══════════════════════════════════════════
      Tab内容渲染：私信任务（自 viewDm 提取，渲染到 interact-content）
      ═══════════════════════════════════════════ */
-  async function renderDmTab(content) {
+  async function renderDmTab(content, pre) {
     // 进入本Tab时清理批量轮询
     if (window._dmBatchTimer) { clearInterval(window._dmBatchTimer); window._dmBatchTimer = null; }
 
     const [queue, meta, cfg, results] = await Promise.all([
-      API.getDmQueue(),
+      // pre.dm 由 viewInteract 预取（卡片计数已拉过一次），直接复用
+      (pre && Array.isArray(pre.dm)) ? Promise.resolve(pre.dm) : API.getDmQueue(),
       API.getLeadStatusMeta(),
       (API.getDmSenderConfig ? API.getDmSenderConfig() : Promise.resolve(null)),
       (API.fetchDmSendResults ? API.fetchDmSendResults(50) : Promise.resolve([])),
@@ -2015,7 +2242,7 @@
     try {
       const allScripts = await API.getScripts();
       inboxState.scripts = allScripts.filter((s) =>
-        ['private_message', 'wechat_guide', 'objection'].includes(s.category)
+        ['welcome', 'private_message', 'wechat_guide', 'objection'].includes(s.category)
       );
     } catch (e) {
       inboxState.scripts = [];
@@ -2218,10 +2445,11 @@
         }
       });
 
-      // 话术快捷插入
-      $('#inbox-script-select', detailEl)?.addEventListener('change', (e) => {
+      // 话术快捷插入（含 {变量} 按当前画像解析）
+      $('#inbox-script-select', detailEl)?.addEventListener('change', async (e) => {
         if (e.target.value && replyInput) {
-          replyInput.value = e.target.value;
+          const ctx = await ensureProfileCtx();
+          replyInput.value = resolveProfileVars(e.target.value, ctx);
           replyInput.focus();
         }
       });
@@ -2336,19 +2564,38 @@
     renderDetail();
   }
 
+
+  // 评论时间：采集回来是 unix 秒（10 位）/ 毫秒（13 位），也可能已是字符串
+  function fmtCommentTime(v) {
+    const raw = String(v || '').trim();
+    if (!raw) return '';
+    let d = null;
+    if (/^\d{10}$/.test(raw)) d = new Date(parseInt(raw, 10) * 1000);
+    else if (/^\d{13}$/.test(raw)) d = new Date(parseInt(raw, 10));
+    if (!d) return raw;
+    if (isNaN(d.getTime())) return raw;
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
   /* ═══════════════════════════════════════════
      Tab内容渲染：评论回复（自 viewComments 提取，渲染到 interact-content）
      ═══════════════════════════════════════════ */
-  async function renderCommentsTab(content) {
+  // 评论回复 Tab 的跨渲染选中集合（勾选后批量操作；批量动作完成后清空）
+  const interactSel = new Set();
+
+  async function renderCommentsTab(content, pre) {
     const [allTasks, scriptsAll] = await Promise.all([
-      API.getCommentTasks(),
+      // pre.comments 由 viewInteract 预取（卡片计数已拉过一次），直接复用，不再重复请求
+      (pre && Array.isArray(pre.comments)) ? Promise.resolve(pre.comments) : API.getCommentTasks(),
       API.getScripts(),
     ]);
     const commentScripts = scriptsAll.filter((s) => s.category === 'comment');
     // 待处理 = 待回复 + 回复失败待重发
     // （failed 原先既不在 pending 也不在 tracked，会从两个列表里凭空消失）
-    const pending = allTasks.filter((t) => t.status === 'pending' || t.status === 'failed');
-    const tracked = allTasks.filter((t) => ['replied', 'user_replied', 'user_dm', 'ignored'].includes(t.status));
+    // 两个列表都按评论时间倒序：最新的评论在最上面（评论时间缺失时按创建时间排）
+    const pending = sortByCommentTimeDesc(allTasks.filter((t) => t.status === 'pending' || t.status === 'failed'));
+    const tracked = sortByCommentTimeDesc(allTasks.filter((t) => ['replied', 'user_replied', 'user_dm', 'ignored'].includes(t.status)));
 
     function taskRow(t, isPending) {
       const meta = COMMENT_STATUS_META[t.status] || { label: t.status, cls: 'pending' };
@@ -2400,13 +2647,18 @@
         ? subs.reduce((a, b) => ((b.level > a.level) || (b.level === a.level && (b.repliedAt > a.repliedAt))) ? b : a)
         : null;
       // 对话根块（被切入/回复的那条评论，对方就在它下面接话）
+      // v009：完整上下文——评论人 / 评论时间 / 视频名称 / 视频链接，一眼看清要回谁、回哪儿
+      const videoLabel = t.videoTitle || (t.videoId ? ('视频 ' + t.videoId) : '未知视频');
+      const cmtTime = fmtCommentTime(t.commentTime);
       const l1 = `
         <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-soft)">
           <span style="display:inline-block;background:var(--ink-soft);color:#fff;border-radius:4px;padding:1px 5px;font-size:10px">原评论</span>
-          ${t.account ? `<span style="color:var(--ink-faint)">· ${esc(t.account)}</span>` : ''}
+          <b style="color:var(--ink)">👤 ${esc(t.commentAuthor || '未知评论人')}</b>
+          ${cmtTime ? `<span style="color:var(--ink-faint)">· ${esc(cmtTime)}</span>` : ''}
+          ${t.account ? `<span style="color:var(--ink-faint)">· 账号 ${esc(t.account)}</span>` : ''}
         </div>
         <div style="font-size:13px;font-weight:600;margin-top:3px">${esc(t.commentContent || '(无评论内容)')}</div>
-        <div style="font-size:11px;color:var(--ink-faint);margin-top:2px">🎬 ${esc(t.videoTitle || '未知视频')}${t.videoUrl ? ` · <a href="${esc(t.videoUrl)}" target="_blank" rel="noopener" style="color:var(--brand-deep)">打开视频↗</a>` : ''}</div>`;
+        <div style="font-size:11px;color:var(--ink-faint);margin-top:2px">🎬 ${esc(videoLabel)}${t.videoUrl ? ` · <a href="${esc(t.videoUrl)}" target="_blank" rel="noopener" style="color:var(--brand-deep)">打开视频↗</a>` : ''}</div>`;
       // v008：多级回复统计条
       const statHtml = subs.length ? `
         <div style="margin-top:8px;font-size:11px;color:var(--ink-soft)">
@@ -2418,13 +2670,21 @@
         ? (latestSub ? `💬 ${esc(latestSub.content)}` : (t.userReplyContent ? `💬 ${esc(t.userReplyContent)}` : '<span style="color:var(--ink-faint)">（未带回内容）</span>'))
         : (t.replyContent ? esc(t.replyContent) : '<span style="color:var(--ink-faint)">未回复</span>');
       const ops = isPending
-        ? `<button type="button" class="btn btn--primary btn--sm" data-reply="${t.id}">选择话术回复</button>`
+        ? `<button type="button" class="btn btn--primary btn--sm" data-reply="${t.id}">选择话术回复</button>
+           <button type="button" class="btn btn--ghost btn--sm" data-ct-delete="${t.id}" title="删除这条评论回复任务" style="margin-left:4px;color:var(--danger);border-color:var(--danger)">删除</button>`
         : `<button type="button" class="btn btn--sm" data-mark="${t.id}" data-status="user_replied">标记追评</button>
              <button type="button" class="btn btn--sm" data-mark="${t.id}" data-status="user_dm" style="margin-left:4px">标记私信★</button>` +
            (hasUnreplied
              ? `<button type="button" class="btn btn--sm btn--primary" data-continue="${t.id}" style="margin-left:4px">继续回复</button>`
-             : '');
+             : '') +
+           `<button type="button" class="btn btn--ghost btn--sm" data-ct-delete="${t.id}" title="删除这条评论回复任务" style="margin-left:4px;color:var(--danger);border-color:var(--danger)">删除</button>`;
+      const cmtTimeCell = fmtCommentTime(t.commentTime);
       return `<tr ${highlight}>
+        <td style="width:34px"><input type="checkbox" class="csel" data-sel="${esc(t.id)}" ${interactSel.has(t.id) ? 'checked' : ''} aria-label="选中这条评论任务"></td>
+        <td style="width:104px">
+          <div style="font-weight:600;font-size:12.5px">${esc(t.commentAuthor || '未知')}</div>
+          ${cmtTimeCell ? `<div class="muted" style="font-size:11px">${esc(cmtTimeCell)}</div>` : ''}
+        </td>
         <td>${l1}${treeHtml}${statHtml}</td>
         <td><span class="tag tag--${meta.cls}">${esc(meta.label)}</span></td>
         <td style="font-size:12px">${esc(t.account || '—')}</td>
@@ -2433,9 +2693,31 @@
       </tr>`;
     }
 
+    // 批量操作条：group = pending（待处理） / tracked（已回复追踪）
+    function selCount(group) {
+      const ids = group === 'pending' ? pending : tracked;
+      return ids.filter((t) => interactSel.has(t.id)).length;
+    }
+    function batchBar(group, rows) {
+      const n = selCount(group);
+      const ops = group === 'pending'
+        ? `<button type="button" class="btn btn--sm btn--primary" data-batch="reply" ${n ? '' : 'disabled'}>批量回复</button>
+           <button type="button" class="btn btn--sm" data-batch="ignore" ${n ? '' : 'disabled'}>批量忽略</button>
+           <button type="button" class="btn btn--sm" data-batch="delete" ${n ? '' : 'disabled'} style="margin-left:4px;color:var(--danger);border-color:var(--danger)">批量删除</button>`
+        : `<button type="button" class="btn btn--sm" data-batch="mark:user_replied" ${n ? '' : 'disabled'}>标记追评</button>
+           <button type="button" class="btn btn--sm btn--primary" data-batch="mark:user_dm" ${n ? '' : 'disabled'}>标记私信★</button>
+           <button type="button" class="btn btn--sm" data-batch="delete" ${n ? '' : 'disabled'} style="margin-left:4px;color:var(--danger);border-color:var(--danger)">批量删除</button>`;
+      return `<div class="cbtch" data-group="${group}">
+        <label class="cbtch__all"><input type="checkbox" data-selall="${group}"> 全选本表</label>
+        <span class="cbtch__n">已选 <b data-seln>${n}</b> / ${rows.length} 条</span>
+        <span class="cbtch__sp"></span>
+        ${ops}
+        <button type="button" class="btn btn--sm btn--ghost" data-batch="clear" ${n ? '' : 'disabled'}>取消选择</button>
+      </div>`;
+    }
+
     content.innerHTML = `
       <div style="display:flex;flex-direction:column;gap:22px">
-        <p class="interact-hint" role="note">本页负责<b>执行与追踪</b>：把已确认的回复落地发送，并跟进对方是否追评、是否转私信。评论的语义分级、话术生成与质检请在 <a href="#/comment-growth">评论获客</a> 完成，两处不再重复操作。</p>
         <div id="reply-agent-bar" role="note" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 14px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--surface);font-size:12.5px">
           <span>回复由<b>自动化浏览器</b>真实发送到抖音，该浏览器需保持登录（与采集用的浏览器相互独立）。</span>
           <span style="flex:1"></span>
@@ -2452,10 +2734,11 @@
             <span class="tag tag--pending">${pending.length} 条待处理</span>
           </div>
           ${pending.length > 0 ? `
+          ${batchBar('pending', pending)}
           <div class="table-wrap">
             <table class="data">
-              <thead><tr><th>评论内容 / 来源视频</th><th style="width:80px">状态</th><th style="width:110px">负责账号</th><th>回复内容</th><th style="width:140px;text-align:right">操作</th></tr></thead>
-              <tbody>${pending.map((t) => taskRow(t, true)).join('')}</tbody>
+              <thead><tr><th style="width:34px"><input type="checkbox" data-selall="pending" aria-label="全选待处理"></th><th>评论人</th><th>评论内容 / 来源视频</th><th style="width:80px">状态</th><th style="width:110px">负责账号</th><th>回复内容</th><th style="width:140px;text-align:right">操作</th></tr></thead>
+              <tbody data-it-pending="1">${pending.slice(0, 40).map((t) => taskRow(t, true)).join('')}</tbody>
             </table>
           </div>` : `
           <div class="empty">
@@ -2475,10 +2758,11 @@
             <span class="tag tag--wechat" style="margin-left:4px">私信★ ${tracked.filter((t) => t.status === 'user_dm').length}</span>
           </div>
           ${tracked.length > 0 ? `
+          ${batchBar('tracked', tracked)}
           <div class="table-wrap">
             <table class="data">
-              <thead><tr><th>评论内容 / 来源视频</th><th style="width:90px">状态</th><th style="width:110px">负责账号</th><th>回复内容</th><th style="width:200px;text-align:right">转化标记</th></tr></thead>
-              <tbody>${tracked.map((t) => taskRow(t, false)).join('')}</tbody>
+              <thead><tr><th style="width:34px"><input type="checkbox" data-selall="tracked" aria-label="全选已回复"></th><th>评论人</th><th>评论内容 / 来源视频</th><th style="width:90px">状态</th><th style="width:110px">负责账号</th><th>回复内容</th><th style="width:200px;text-align:right">转化标记</th></tr></thead>
+              <tbody data-it-tracked="1">${tracked.slice(0, 40).map((t) => taskRow(t, false)).join('')}</tbody>
             </table>
           </div>` : `
           <div class="empty">
@@ -2487,6 +2771,10 @@
           </div>`}
         </div>
       </div>`;
+
+    // 大列表分批补行（首屏先出 40 行保证能滚动）
+    fillRowsProgressive(content.querySelector('[data-it-pending]'), pending, (t) => taskRow(t, true));
+    fillRowsProgressive(content.querySelector('[data-it-tracked]'), tracked, (t) => taskRow(t, false));
 
     // 绑定自动化浏览器状态条（评论真实发送所依赖的那台浏览器）
     const agentState = $('#reply-agent-state', content);
@@ -2524,6 +2812,8 @@
       showAgent(s);
       btn.disabled = false;
       if (s && s.loggedIn === false) toast('浏览器已打开，请在窗口中扫码登录抖音', 'warn');
+      // 启动浏览器并登录成功后，把已登录的抖音号同步进账号列表
+      try { await API.syncDouyinAccount(); await refreshAccounts(); } catch (_) {}
     });
 
     // 绑定回复按钮
@@ -2570,6 +2860,113 @@
         }
       });
     });
+
+    // ── 批量选择：勾选 / 全选 / 批量操作 ──
+    function refreshSelUi() {
+      $$('.csel', content).forEach((cb) => { cb.checked = interactSel.has(cb.dataset.sel); });
+      const rowsOf = (g) => (g === 'pending' ? pending : tracked);
+      $$('.cbtch', content).forEach((bar) => {
+        const g = bar.dataset.group;
+        const rows = rowsOf(g);
+        const n = rows.filter((t) => interactSel.has(t.id)).length;
+        const bn = bar.querySelector('[data-seln]');
+        if (bn) bn.textContent = n;
+        bar.querySelectorAll('[data-batch]').forEach((b) => { b.disabled = !n; });
+        const all = bar.querySelector('[data-selall]');
+        if (all) {
+          all.checked = rows.length > 0 && n === rows.length;
+          all.indeterminate = n > 0 && n < rows.length;
+        }
+      });
+      $$('thead [data-selall]', content).forEach((all) => {
+        const rows = rowsOf(all.dataset.selall);
+        const n = rows.filter((t) => interactSel.has(t.id)).length;
+        all.checked = rows.length > 0 && n === rows.length;
+        all.indeterminate = n > 0 && n < rows.length;
+      });
+    }
+
+    content.addEventListener('change', (e) => {
+      const el = e.target;
+      if (el.matches && el.matches('.csel')) {
+        if (el.checked) interactSel.add(el.dataset.sel); else interactSel.delete(el.dataset.sel);
+        refreshSelUi();
+      } else if (el.matches && el.matches('[data-selall]')) {
+        const rows = el.dataset.selall === 'pending' ? pending : tracked;
+        rows.forEach((t) => { if (el.checked) interactSel.add(t.id); else interactSel.delete(t.id); });
+        refreshSelUi();
+      }
+    });
+
+    async function batchMark(ids, status, label) {
+      let ok = 0, fail = 0;
+      for (const id of ids) {
+        try {
+          const r = await API.updateCommentTask(id, { status });
+          if (r && r.ok !== false) ok++; else fail++;
+        } catch (e) { fail++; }
+      }
+      interactSel.clear();
+      toast(`批量${label}：成功 ${ok} 条${fail ? `，失败 ${fail} 条` : ''}`, fail ? 'warn' : 'ok');
+      route();
+    }
+
+    /* ── 删除单条评论回复任务 ── */
+    async function ctDelete(id) {
+      if (!confirm('确定删除这条评论回复任务吗？')) return;
+      try {
+        await API.deleteCommentTask(id);
+        interactSel.delete(id);
+        toast('删除成功', 'ok');
+        route(); // 重新渲染当前Tab
+      } catch (e) {
+        toast('删除失败：' + (e.message || e), 'warn');
+      }
+    }
+
+    /* ── 批量删除评论回复任务：单条失败不中断，最后汇总提示 ── */
+    async function ctDeleteBatch(ids) {
+      if (!ids || !ids.length) return;
+      if (!confirm(`确定删除选中的 ${ids.length} 条评论回复任务吗？`)) return;
+      let ok = 0, fail = 0;
+      for (const id of ids) {
+        try {
+          await API.deleteCommentTask(id);
+          interactSel.delete(id);
+          ok += 1;
+        } catch (e) {
+          fail += 1;
+        }
+      }
+      interactSel.clear();
+      toast(`删除成功 ${ok} 条` + (fail ? `，失败 ${fail} 条` : ''), ok ? 'ok' : 'warn');
+      route();
+    }
+
+    content.addEventListener('click', async (e) => {
+      // 单条删除
+      const delOne = e.target.closest('[data-ct-delete]');
+      if (delOne && !delOne.disabled) { ctDelete(delOne.dataset.ctDelete); return; }
+
+      const btn = e.target.closest('[data-batch]');
+      if (!btn || btn.disabled) return;
+      const bar = btn.closest('.cbtch');
+      const group = bar ? bar.dataset.group : '';
+      const rows = group === 'pending' ? pending : tracked;
+      const ids = rows.filter((t) => interactSel.has(t.id)).map((t) => t.id);
+      const act = btn.dataset.batch;
+      if (act === 'clear') { interactSel.clear(); refreshSelUi(); return; }
+      if (!ids.length) return;
+      if (act === 'reply') { openBatchReplyModal(ids, commentScripts, allTasks); return; }
+      if (act === 'delete') { await ctDeleteBatch(ids); return; }
+      const status = act.indexOf('mark:') === 0 ? act.slice(5) : 'ignored';
+      const label = status === 'ignored' ? '忽略' : (status === 'user_dm' ? '标记私信★' : '标记追评');
+      if (!window.confirm(`确认把选中的 ${ids.length} 条${label}？`)) return;
+      btn.disabled = true;
+      await batchMark(ids, status, label);
+    });
+
+    refreshSelUi();
   }
 
   /* ═══════════════════════════════════════════
@@ -2868,7 +3265,7 @@
     try {
       const allScripts = await API.getScripts();
       inboxState.scripts = allScripts.filter((s) =>
-        ['private_message', 'wechat_guide', 'objection'].includes(s.category)
+        ['welcome', 'private_message', 'wechat_guide', 'objection'].includes(s.category)
       );
     } catch (e) {
       inboxState.scripts = [];
@@ -3027,10 +3424,11 @@
         }
       });
 
-      // 话术快捷插入
-      $('#inbox-script-select', detailEl)?.addEventListener('change', (e) => {
+      // 话术快捷插入（含 {变量} 按当前画像解析）
+      $('#inbox-script-select', detailEl)?.addEventListener('change', async (e) => {
         if (e.target.value && replyInput) {
-          replyInput.value = e.target.value;
+          const ctx = await ensureProfileCtx();
+          replyInput.value = resolveProfileVars(e.target.value, ctx);
           replyInput.focus();
         }
       });
@@ -3148,9 +3546,12 @@
   /* ═══════════════════════════════════════════
      视图：客户与商机（IMP-028/029/031）
      ═══════════════════════════════════════════ */
-  const STAGE_ORDER = ['added', 'measured', 'proposal', 'quoted', 'negotiating'];
+  /* 通用成交流程，不绑定任何行业：已加微 → 需求沟通 → 方案中 → 已报价 → 谈判中 → 成交/流失。
+     原「已量房」为装修专属阶段，已替换为「需求沟通」。 */
+  const STAGE_ORDER = ['added', 'discovery', 'proposal', 'quoted', 'negotiating'];
   const STAGE_NEXT_LABEL = {
-    added: '已量房（预约量房）', measured: '方案中（出方案）', proposal: '已报价（发报价单）', quoted: '谈判中', negotiating: '成交（签约）',
+    added: '需求沟通（聊清需求）', discovery: '方案中（出方案）', proposal: '已报价（发报价）',
+    quoted: '谈判中', negotiating: '成交（签约）',
   };
 
   async function viewCustomers() {
@@ -3167,18 +3568,21 @@
     const pipeline = allStages.map((k) => {
       const list = custs.filter((c) => c.stage === k);
       const value = list.reduce((s, c) => s + (c.estValue || 0), 0);
+      const meta = stages[k] || { label: k };
+      // 悬停说明取后端 stage-meta 的 desc（通用措辞，让非装修行业也知道这一步指什么）
+      const tip = meta.desc ? `${meta.label}：${meta.desc}` : meta.label;
       return `
         <button type="button" class="stage-card ${k === 'won' ? 'stage-card--won' : ''} ${k === 'lost' ? 'stage-card--lost' : ''}"
-                data-stage="${k}" aria-pressed="${state.custFilter === k}">
+                data-stage="${k}" aria-pressed="${state.custFilter === k}" title="${esc(tip)}">
           <span class="stage-card__count" style="color:${k === 'won' ? 'var(--brand-deep)' : k === 'lost' ? 'var(--ink-faint)' : 'var(--ink)'}">${list.length}</span>
-          <span class="stage-card__label">${esc(stages[k].label)}</span>
+          <span class="stage-card__label">${esc(meta.label)}</span>
           <span class="stage-card__sub">${list.length ? (k === 'lost' ? '累计流失' : wan(value)) : '—'}</span>
         </button>`;
     }).join('');
 
     main.innerHTML = `
       <div class="view">
-        ${pageHead({ icon: 'people', title: '客户与商机', desc: '加微后的成交流程：量房 → 方案 → 报价 → 谈判 → 成交（stage 与获客 status 正交）' })}
+        ${pageHead({ icon: 'people', title: '客户与商机', desc: '加微后的通用成交流程：需求沟通 → 方案 → 报价 → 谈判 → 成交（不绑定行业，与获客状态正交）' })}
         <div class="pipeline" role="group" aria-label="按商机阶段筛选">${pipeline}</div>
         <div class="card">
           <div class="table-wrap">
@@ -3304,22 +3708,31 @@
 
     const lostBtn = $('#cu-lost');
     if (lostBtn) lostBtn.addEventListener('click', () => {
+      // 流失原因：通用分类（对应后端 LostReasonCategory），不绑定行业，且上报结构化 category
+      const LOST_REASONS = [
+        ['price', '预算不匹配 / 觉得贵'],
+        ['competitor', '选择了竞争对手'],
+        ['no_need', '暂时没有需求'],
+        ['timing', '时机不成熟 / 计划推迟'],
+        ['contact_lost', '联系不上 / 失联'],
+        ['other', '其他原因'],
+      ];
       openModal(`
         <h2 id="modal-title">标记流失 · ${esc(c.name)}</h2>
-        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:12px">流失原因将沉淀数据，用于后续流失挽回 SOP（P2）。</p>
+        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:12px">流失原因会沉淀成数据，用于后续流失挽回 SOP（P2）。</p>
         <div class="field"><label for="lost-reason">流失原因</label>
           <select id="lost-reason">
-            <option>预算不匹配</option>
-            <option>选了竞争对手</option>
-            <option>装修计划推迟</option>
-            <option>其他</option>
+            ${LOST_REASONS.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join('')}
           </select></div>
         <div class="modal__foot">
           <button type="button" class="btn" data-close>取消</button>
           <button type="button" class="btn btn--danger-outline" id="lost-save">确认标记流失</button>
         </div>`);
       $('#lost-save').addEventListener('click', async () => {
-        await API.markLost(c.id, $('#lost-reason').value);
+        const sel = $('#lost-reason');
+        const cat = sel.value;
+        const note = ((sel.selectedOptions && sel.selectedOptions[0]) || {}).textContent || cat;
+        await API.markLost(c.id, cat, note.trim());
         closeModal(); close();
         toast('已标记流失');
         viewCustomers();
@@ -3391,7 +3804,7 @@
         ${overdue.length ? `
           <div class="card" style="border-color:#e5b7b0">
             <div class="card__head"><span class="card__title" style="color:var(--danger)">⚠ 已逾期</span>
-              <span class="card__hint">先处理逾期的——装修决策周期 1-2 个月，跟丢即流失</span></div>
+              <span class="card__hint">先处理逾期的——跟丢一次可能就没下次，逾期越久成交概率越低</span></div>
             <div class="todo">${overdue.map(todoItem).join('')}</div>
           </div>` : ''}
 
@@ -3489,7 +3902,7 @@
             <div class="card__head"><span class="card__title">账怎么算</span></div>
             <dl class="kv">
               <dt>投入</dt><dd>¥${fmt(d.cost.totalSpend)}（人力+工具）</dd>
-              <dt>客单价</dt><dd>¥${fmt(d.cost.avgDealAmount)}（装修 2-30 万区间）</dd>
+              <dt>客单价</dt><dd>¥${fmt(d.cost.avgDealAmount)}（按你录入的成交额统计）</dd>
               <dt>成交额</dt><dd>¥${fmt(deal * d.cost.avgDealAmount)}</dd>
               <dt>ROI</dt><dd><strong style="color:var(--ok)">${((deal * d.cost.avgDealAmount) / d.cost.totalSpend).toFixed(1)} 倍</strong></dd>
               <dt>一个加微值</dt><dd><strong>${wan(Math.round((deal * d.cost.avgDealAmount) / wechat))}</strong>（IMP-029 成交录入后可精确到实际金额）</dd>
@@ -4242,8 +4655,8 @@
           <div class="card">
             <div class="card__head"><span class="card__title">话术贡献</span></div>
             <dl class="kv">
-              <dt>变体A</dt><dd>24 加微 / 214 发送 · 转化率 11.2%（R2 保活在用）</dd>
-              <dt>变体B</dt><dd>3 加微 / 51 发送 · 转化率 5.9%（R2 已自动停用）</dd>
+              <dt>变体A</dt><dd>24 加微 / 214 发送 · 转化率 11.2%（变体按权重随机分配）</dd>
+              <dt>变体B</dt><dd>3 加微 / 51 发送 · 转化率 5.9%（变体按权重随机分配）</dd>
             </dl>
             <p class="card__hint" style="margin-top:10px">变体级明细见「话术库」——哪句话在换钱，一目了然。</p>
           </div>
@@ -4325,94 +4738,1069 @@
      视图：话术库（IMP-005 / R2）
      ═══════════════════════════════════════════ */
   /* ══════════ 话术库分类 Tab 状态 ══════════ */
-  const scriptTabState = { category: 'all' };
+  /** 话术库筛选状态：category = 分类页签；focusId = 从变量下拉点名的那条话术（只显示这一条并高亮定位）；
+      val = 下拉里选的「画像可选值」{k: 变量名, v: 值}，用来筛下面的话术卡片。 */
+  const scriptTabState = { category: 'all', focusId: null, val: null };
   const SCRIPT_TABS = [
     { key: 'all',             label: '全部' },
     { key: 'comment',         label: '评论话术' },
+    { key: 'welcome',         label: '欢迎语/首句' },
     { key: 'private_message', label: '私信话术' },
     { key: 'wechat_guide',    label: '微信引导' },
     { key: 'objection',       label: '异议处理' },
     { key: 'nurture',         label: '培育SOP' },
   ];
 
-  async function viewScripts() {
-    const [scripts, templates] = await Promise.all([API.getScripts(), API.getScriptTemplates()]);
+  /* 场景分类：话术库按这 5 类做就绪检查（原「话术策略」卡片的功能，2026-09-13 迁到话术库页顶部） */
+  const SCRIPT_SCENE_CATS = [
+    { key: 'comment',         label: '评论区首次触达', hint: '在别人的评论区公开回复时用' },
+    { key: 'welcome',         label: '欢迎语首句',     hint: '用户进私信后第一句，让 TA 开口' },
+    { key: 'private_message', label: '私信开场',       hint: '私信第一句话' },
+    { key: 'wechat_guide',    label: '加微引导',       hint: '引导对方加微信时用' },
+    { key: 'objection',       label: '异议应对',       hint: '对方说「太贵了 / 再考虑」时用' },
+  ];
 
-    function render() {
-      const cat = scriptTabState.category;
-      const filtered = cat === 'all' ? scripts : scripts.filter((s) => s.category === cat);
-      const tabsHtml = SCRIPT_TABS.map((t) => {
-        const count = t.key === 'all' ? scripts.length : scripts.filter((s) => s.category === t.key).length;
-        return `<button type="button" class="subtab-btn" data-cat="${t.key}" aria-selected="${cat === t.key}">${esc(t.label)}<span class="count">${count}</span></button>`;
+  /* 老版 ScriptStrategy 的四段文本 → 话术库分类，用于一次性迁移（入口在话术库页顶部） */
+  const SCRIPT_LEGACY_MAP = {
+    commentScript: 'comment',
+    privateMessageScript: 'private_message',
+    wechatScript: 'wechat_guide',
+    objectionScript: 'objection',
+  };
+
+  /* 「话术与业务配置」页：业务画像 + 话术库同处一页（2026-09-13 合并） */
+  const SCRIPT_OUTER_TABS = [
+    { key: 'business', label: '业务画像' },
+    { key: 'scripts',  label: '话术库' },
+  ];
+
+  /* ══════════ 话术变量绑定（P1：业务画像 → 话术库 实时贯通） ══════════
+     话术文本里写 {行业}{产品}{区域}… 占位符，发送/预览时由当前业务画像实时解析。
+     改了画像 → 所有用变量的话术自动跟着变，不用重新生成。 */
+  /* src = 该变量来自「业务画像」的哪张卡片；label = 那边对应的字段名。
+     变量清单与业务画像字段一一对应：画像里加了字段，这里补一行，变量就跟着有。 */
+  const VAR_SRC = {
+    business: { label: '业务画像',   tab: 'business' },
+    product:  { label: '产品知识库', tab: 'business' },
+    audience: { label: '目标客户',   tab: 'business' },
+    wechat:   { label: '微信转化',   tab: 'business' },
+  };
+  /* pick: true = 该变量来自业务画像的「选择项」字段（下拉 / 多选标签），会出现在话术库的筛选项里。
+     ⚠️ 纯文本字段（人设 / 简介 / 常见问题 / 服务流程 / 成功案例 / 不接客户 / 优惠 / 微信号）不打 pick：
+     它们仍可作为 {变量} 插进话术，但不在话术库筛选区显示（用户只要画像里的选择项）。 */
+  const SCRIPT_VARS = [
+    /* ① 业务画像 */
+    { key: '行业',     pick: true, opt: 'industry', src: 'business', label: '所属行业', get: (p) => (p.business || {}).industry || '' },
+    { key: '产品',     pick: true, opt: 'product',  src: 'product', label: '主营产品 / 产品名称', get: (p) => (p.product || {}).productName || '' },
+    { key: '区域',     pick: true, opt: 'area',     src: 'business', label: '服务区域', get: (p) => (p.business || {}).serviceArea || '' },
+    { key: '客户类型', pick: true, opt: 'target',   src: 'business', label: '目标客户', get: (p) => (p.business || {}).targetCustomer || '' },
+    { key: '价格',     pick: true, opt: 'price',    src: 'product', label: '价格区间', get: (p) => (p.product || {}).priceRange || '' },
+    { key: '目标',     pick: true, opt: 'goal',     src: 'business', label: '转化目标', get: (p) => (p.business || {}).conversionGoal || '' },
+    { key: '语气',     pick: true, opt: 'tone',     src: 'business', label: '沟通语气', get: (p) => (p.business || {}).tone || '' },
+    { key: '人设',     src: 'business', label: '人设 / 自我介绍', get: (p) => arrJoin((p.business || {}).selfIntro) },
+    { key: '服务流程', src: 'product', label: '服务流程', get: (p) => arrJoin((p.product || {}).serviceProcess) },
+    { key: '成功案例', src: 'product', label: '成功案例', get: (p) => arrJoin((p.product || {}).caseStudies) },
+    { key: '不接客户', src: 'audience', label: '不接的客户', get: (p) => arrJoin((p.audience || {}).excludedCustomers) },
+    { key: '优惠',     src: 'wechat', label: '优惠 / 钩子', get: (p) => arrJoin((p.wechat || {}).offerHook) },
+    /* ② 产品知识库 */
+    { key: '简介',     src: 'product', label: '产品简介', get: (p) => (p.product || {}).description || '' },
+    { key: '卖点',     pick: true, opt: 'sellingPoints', src: 'product', label: '核心卖点', get: (p) => arrJoin((p.product || {}).sellingPoints) },
+    { key: '客户特点', pick: true, opt: 'target',        src: 'business', label: '目标客户', get: (p) => (p.business || {}).targetCustomer || '' },
+    { key: '常见问题', src: 'product', label: '常见问题 FAQ', get: (p) => arrJoin((p.product || {}).faq, '；') },
+    /* ③ 目标客户 */
+    { key: '客户群',   pick: true, opt: 'groupName',  src: 'audience', label: '客户群名称', get: (p) => (p.audience || {}).name || '' },
+    { key: '客户行业', pick: true, opt: 'industry',   src: 'audience', label: '所属行业', get: (p) => (p.audience || {}).industry || '' },
+    { key: '客户区域', pick: true, opt: 'area',       src: 'audience', label: '所在区域', get: (p) => (p.audience || {}).region || '' },
+    { key: '需求',     pick: true, opt: 'needs',      src: 'audience', label: '核心需求 / 意向关键词', get: (p) => arrJoin((p.audience || {}).needs) || arrJoin((p.audience || {}).intentKeywords) },
+    { key: '意向词',   pick: true, opt: 'intentKw',   src: 'audience', label: '意向关键词', get: (p) => arrJoin((p.audience || {}).intentKeywords) },
+    { key: '痛点',     pick: true, opt: 'pain',       src: 'audience', label: '主要痛点', get: (p) => arrJoin((p.audience || {}).painPoints) },
+    { key: '排除词',   pick: true, opt: 'excludedKw', src: 'audience', label: '排除关键词', get: (p) => arrJoin((p.audience || {}).excludedKeywords) },
+    /* ④ 微信转化 */
+    { key: '微信号',   src: 'wechat', label: '微信号 / 企业微信', get: (p) => (p.wechat || {}).wechatId || '' },
+    { key: '引导时机', pick: true, opt: 'timing',      src: 'wechat', label: '引导加微的时机', get: (p) => (p.wechat || {}).guideTiming || '' },
+    { key: '引导理由', pick: true, opt: 'guideReason', src: 'wechat', label: '加微理由', get: (p) => (p.wechat || {}).guideReason || '' },
+  ];
+  /** 话术库筛选区只显示「选择项」变量（画像里是下拉 / 多选标签的字段） */
+  const SCRIPT_PICK_VARS = SCRIPT_VARS.filter((v) => v.pick);
+  const SCRIPT_VAR_KEYS = SCRIPT_VARS.map((v) => v.key);
+
+  /* ══════════ 变量下拉的「可选值」来源 ══════════
+     下拉里列的是业务画像里**这个字段的全部可选值**（和画像弹窗里的下拉同一份 BIZ_OPTIONS），
+     不是"现有话术用到它"的列表 —— 话术库一条话术都没有时，下拉照样列得出来。 */
+  /** 某变量的选项库：opt 指向 BIZ_OPTIONS 的 key；product 特殊（随「所属行业」联动，未匹配走通用兜底） */
+  function varOptList(v, ctx) {
+    if (!v || !v.opt) return [];
+    if (v.opt === 'product') {
+      const ind = String((((ctx || {}).business || {}).industry) || '').trim();
+      return BIZ_OPTIONS.productByIndustry[ind] || BIZ_OPTIONS.productGeneric || [];
+    }
+    return BIZ_OPTIONS[v.opt] || [];
+  }
+  /** 画像里这个变量当前选中的值（多选标签字段按、,，换行 拆成数组；单选就一条） */
+  function varCurList(v, ctx) {
+    const raw = String((v && v.get(ctx || {})) || '').trim();
+    return raw ? raw.split(/[、,，\n]/).map((x) => x.trim()).filter(Boolean) : [];
+  }
+  /** 话术全文（所有变体 + 欢迎语）：按可选值筛话术时，用来判断"正文里写没写到这个值" */
+  function scriptFullText(s) {
+    if (!s) return '';
+    return ((s.variants || []).map((v) => v.text || '').join('\n')) + '\n' + (s.welcomeMsg || '');
+  }
+  /** 按「画像可选值」筛一条话术：正文里写到过这个值，或这条话术引用了对应的 {变量}。
+      引用变量的话术换任何值都适用，所以只要它还在用这个变量就算命中 —— 避免筛出来是空的。 */
+  function scriptMatchVal(s, pick) {
+    if (!pick || !pick.k) return true;
+    if (scriptFullText(s).indexOf(pick.v) !== -1) return true;
+    return scriptVarsOf(s).includes(pick.k);
+  }
+
+  /** 变量芯片（按来源卡片分组）：点一下把 {变量} 插进光标处（弹窗里的插入条用） */
+  function varChipsHtml(ctx) {
+    return Object.keys(VAR_SRC).map((g) => {
+      const list = SCRIPT_VARS.filter((v) => v.src === g);
+      if (!list.length) return '';
+      const chips = list.map((v) => {
+        const val = String(v.get(ctx || {}) || '').trim();
+        const tip = VAR_SRC[g].label + ' · ' + v.label + '：' + (val || '未填写');
+        return `<button type="button" class="var-chip" data-var="${esc(v.key)}" title="${esc(tip)}">{${esc(v.key)}}</button>`;
       }).join('');
+      return `<div class="vgroup"><span class="vgroup__name">${esc(VAR_SRC[g].label)}</span><div class="vgroup__chips">${chips}</div></div>`;
+    }).join('');
+  }
 
+  /** 话术库顶部「话术可用变量」筛选区：每个「选择项」变量一个下拉框（和业务画像里的下拉同款）。
+      ① 下拉里**固定列出该字段在业务画像里的全部可选值**（BIZ_OPTIONS）——
+         业务画像没填、话术库一条话术都没有，下拉照样列得出来，不存在"点开是空的"；
+      ② 点一个可选值 → 下面只留"用得上它"的话术（正文写到过这个值，或引用了这个 {变量}）；
+      ③ 面板底部再列出已经引用这个变量的话术，点一条直达那张卡。
+      pool = 当前分类下的话术；pick = 当前已选的可选值 {k: 变量名, v: 值}；
+      allScripts = 全部话术（分类页签的计数要用全量，不能用按分类过滤后的 pool）。
+      ⚠ 本函数在 viewScripts 外层作用域，取不到 viewScripts 里的 `scripts`，必须靠参数传入。 */
+  function varFilterHtml(ctx, pool, focusId, pick, allScripts) {
+    const all = Array.isArray(allScripts) ? allScripts : pool;
+    const focus = pool.find((s) => s.id === focusId) || null;
+    const focusVars = focus ? scriptVarsOf(focus) : [];
+    const on = pick && pick.k ? pick : null;
+    const snippet = (s) => {
+      const v = (s.variants || []).find((x) => (x.text || '').trim());
+      const t = (v && v.text) || s.welcomeMsg || '';
+      return t.replace(/\s+/g, ' ').slice(0, 46) + (t.length > 46 ? '…' : '');
+    };
+    // 分类页签（原来在卡片外面独立一行，现在挪进本卡片，和变量筛选同一处）
+    const catNow = scriptTabState.category;
+    const catsHtml = SCRIPT_TABS.map((t) => {
+      const count = t.key === 'all' ? all.length : all.filter((s) => s.category === t.key).length;
+      return `<button type="button" class="subtab-btn" data-cat="${t.key}" aria-selected="${catNow === t.key}">${esc(t.label)}<span class="count">${count}</span></button>`;
+    }).join('');
+    const groups = Object.keys(VAR_SRC).map((g) => {
+      // 只列业务画像的「选择项」字段（下拉 / 多选标签）；纯文本字段不给筛选（用户要求）
+      const list = SCRIPT_PICK_VARS.filter((v) => v.src === g);
+      if (!list.length) return '';
+      const chips = list.map((v) => {
+        const curVals = varCurList(v, ctx);
+        const curTxt = curVals.join('、');
+        const hit = pool.filter((s) => scriptVarsOf(s).includes(v.key));
+        const isOn = (on && on.k === v.key) || focusVars.includes(v.key);
+        const picked = on && on.k === v.key ? on.v : '';
+        // 可选值 = 选项库 + 画像里手工输入的自定义值（画像允许自定义，这里也要列出来）
+        const lib = varOptList(v, ctx);
+        const opts = curVals.filter((o) => !lib.includes(o)).concat(lib);
+        const tip = `${VAR_SRC[g].label} · ${v.label}：${curTxt || '画像里还没填这一项'}｜${hit.length} 条话术引用`;
+        const optsHtml = opts.length
+          ? `<span class="vpick__opts">${opts.map((o) => {
+              const cls = `vopt${curVals.includes(o) ? ' is-cur' : ''}${picked === o ? ' is-on' : ''}`;
+              return `<button type="button" class="${cls}" data-vopt="${esc(o)}" data-vkey="${esc(v.key)}" role="option" aria-selected="${picked === o}" title="${esc('按「' + o + '」筛话术')}">${esc(o)}</button>`;
+            }).join('')}</span>`
+          : '<span class="vpick__none">这个字段在画像里还没有可选值。</span>';
+        const items = hit.map((s) => `
+            <button type="button" class="vpick__item${s.id === focusId ? ' is-cur' : ''}" data-vgoto="${esc(s.id)}" data-vfrom="${esc(v.key)}">
+              <span class="vpick__name">${esc(s.name)}</span>
+              <span class="vpick__snip">${esc(snippet(s))}</span>
+            </button>`).join('');
+        // 下拉框形态（与业务画像里的下拉字段一致）：左字段名、右当前值/已选值、▾；点开选可选值
+        return `<span class="vsel-wrap">
+            <button type="button" class="vsel${isOn ? ' is-on' : ''}${picked ? ' is-filt' : ''}"
+                data-vchip="${esc(v.key)}" aria-haspopup="true" aria-expanded="${!!isOn}" title="${esc(tip)}">
+              <span class="vsel__k">${esc(v.key)}</span>
+              <span class="vsel__v${(picked || curTxt) ? '' : ' is-empty'}">${esc(picked || curTxt || '未填')}</span>
+              <span class="vsel__caret"></span>
+            </button>
+            <span class="vpick" data-vpanel="${esc(v.key)}" hidden>
+              <span class="vpick__hd">${esc(v.label)}：${curTxt ? '画像当前值「' + esc(curTxt) + '」' : '画像里还没填'} · ${hit.length} 条话术引用</span>
+              <span class="vpick__sec">画像可选值 · 点一个筛下面的话术</span>
+              ${optsHtml}
+              <span class="vpick__sec">用到 {${esc(v.key)}} 的话术 · ${hit.length} 条</span>
+              ${hit.length ? `<span class="vpick__list">${items}</span>`
+                : `<span class="vpick__none">暂时没有话术引用 {${esc(v.key)}}（不影响上面的可选值）。</span>`}
+            </span>
+          </span>`;
+      }).join('');
+      return `<span class="vgroup"><span class="vgroup__name">${esc(VAR_SRC[g].label)}</span><span class="vgroup__chips">${chips}</span></span>`;
+    }).join('');
+    const matched = on ? pool.filter((s) => scriptMatchVal(s, on)).length : pool.length;
+    const stat = on
+      ? `已筛选：<b>${esc(on.k)} = ${esc(on.v)}</b> · 命中 <b>${matched}</b>/${pool.length} 条`
+      : (focus
+        ? `已定位：<b>${esc(focus.name)}</b>`
+        : `共 ${pool.length} 条话术`);
+    return `
+      <div class="card var-card">
+        <div class="var-card__head">
+          <span class="var-card__title">话术可用变量</span>
+          <span class="var-card__desc" title="按业务画像里的「选择项」字段筛话术。下拉框里固定列出画像该字段的全部可选值（画像没填、一条话术都没有，选项也照常列出来）；点一个值 → 下面只看用得上它的话术（正文写到了这个值，或引用了这个 {变量}）。纯文本字段（人设、简介…）仍可插进话术，只是不在这里筛。">按画像的<b>选择项</b>筛话术</span>
+          <span class="var-card__sp"></span>
+          <span class="vfilter__stat">${stat}</span>
+          ${(on || focus) ? '<button type="button" class="btn btn--sm" data-vclear>清除筛选</button>' : ''}
+        </div>
+        <div class="subtabs var-card__cats" role="tablist">${catsHtml}</div>
+        <div class="vfilter">
+          <div class="vfilter__groups">${groups}</div>
+        </div>
+      </div>`;
+  }
+
+  function arrJoin(v, sep) {
+    const s = sep || '、';
+    if (Array.isArray(v)) return v.join(s);
+    if (typeof v === 'string') return v.split(/[\n,，]/).map((x) => x.trim()).filter(Boolean).join(s);
+    return '';
+  }
+
+  /** 把文本里的 {变量} 替换为当前画像值；缺值保留原占位符（便于发现未填项） */
+  function resolveProfileVars(text, ctx) {
+    if (!text || !ctx) return text || '';
+    return String(text).replace(/\{(\S+?)\}/g, (m, k) => {
+      const v = SCRIPT_VARS.find((x) => x.key === k);
+      if (!v) return m;               // 非已知变量，原样保留
+      const val = (v.get(ctx) || '').trim();
+      return val || m;                // 画像未填该项 → 保留占位符，不强行清空
+    });
+  }
+
+  /** 检测一段文本用到了哪些变量（用于话术卡标签） */
+  function detectUsedVars(text) {
+    if (!text) return [];
+    const used = new Set();
+    String(text).replace(/\{(\S+?)\}/g, (m, k) => { if (SCRIPT_VAR_KEYS.includes(k)) used.add(k); return m; });
+    return [...used];
+  }
+
+  /** 业务画像上下文缓存：避免每次发送都打 3~4 个接口 */
+  let _profileCtxCache = null;
+  let _profileCtxLoading = null;
+  async function ensureProfileCtx() {
+    if (_profileCtxCache) return _profileCtxCache;
+    if (_profileCtxLoading) return _profileCtxLoading;
+    _profileCtxLoading = (async () => {
+      const [business, product, audience, wechat] = await Promise.all([
+        API.getBusinessProfile ? API.getBusinessProfile().catch(() => ({})) : Promise.resolve({}),
+        API.getProductKnowledge ? API.getProductKnowledge().catch(() => ({})) : Promise.resolve({}),
+        API.getAudienceProfile ? API.getAudienceProfile().catch(() => ({})) : Promise.resolve({}),
+        API.getWeChatSettings ? API.getWeChatSettings().catch(() => ({})) : Promise.resolve({}),
+      ]);
+      _profileCtxCache = { business: business || {}, product: product || {}, audience: audience || {}, wechat: wechat || {} };
+      return _profileCtxCache;
+    })();
+    try { return await _profileCtxLoading; }
+    finally { _profileCtxLoading = null; }
+  }
+  /** 写完后使缓存失效，下次发送重新取最新画像 */
+  function invalidateProfileCtx() { _profileCtxCache = null; }
+
+  /* ══════════ 话术生成（P2：基于画像 + 差异刷新） ══════════ */
+  const splitLines = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  const splitComma = (s) => String(s || '').split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+
+  /** 当前画像「参与生成」的关键字段快照（仅这些字段变才触发刷新，避免无关字段噪声） */
+  function profileKeySnapshot(biz, product, audience) {
+    return {
+      industry: biz.industry || '',
+      product: product.productName || '',
+      area: biz.serviceArea || '',
+      goal: biz.conversionGoal || '',
+      selling: splitLines(product.sellingPoints).join(' / '),
+      pain: splitLines(audience.painPoints).join(' / '),
+      need: splitComma(audience.intentKeywords).join(' / '),
+    };
+  }
+
+  /** 某条 generated 话术的快照是否「过期」（与当前画像关键字段不同） */
+  function isScriptStale(s, snap) {
+    if (s.source !== 'generated' || !s.generatedFrom) return false;
+    let old;
+    try { old = typeof s.generatedFrom === 'string' ? JSON.parse(s.generatedFrom) : s.generatedFrom; }
+    catch { return false; }
+    if (!old || typeof old !== 'object') return false;
+    return ['industry', 'product', 'area', 'goal', 'selling', 'pain', 'need']
+      .some((k) => (old[k] || '') !== (snap[k] || ''));
+  }
+
+  async function viewScripts(params) {
+    const outerTab = (params && params.get ? params.get('tab') : '') || 'scripts';
+    const wantCat = params && params.get ? params.get('cat') : '';
+    if (wantCat && SCRIPT_TABS.some((t) => t.key === wantCat)) scriptTabState.category = wantCat;
+
+    /* ── P3：资料文件导入流程 ── */
+    async function startMaterialImport(file) {
+      openModal(`<h2 id="modal-title">解析资料中…</h2><p class="modal__lede">正在读取并 AI 抽取 <b>${esc(file.name)}</b></p>`);
+      let extracted;
+      try {
+        const r = await API.importMaterial(file);
+        extracted = (r && r.extracted) || {};
+      } catch (e) {
+        openModal(`<h2 id="modal-title">导入失败</h2><p class="modal__lede">${esc(e.message)}</p><div class="modal__foot"><button type="button" class="btn" data-close>关闭</button></div>`);
+        return;
+      }
+      openImportPreview(file.name, extracted);
+    }
+
+    function openImportPreview(name, ex) {
+      const b = ex.business || {}, p = ex.product || {}, a = ex.audience || {}, h = ex.scriptHints || {};
+      const field = (label, sec, key, rows) => `
+        <label class="imp-field"><span>${label}</span>
+          <textarea data-imp="${sec}.${key}" rows="${rows || 1}">${esc((sec === 'business' ? b : sec === 'product' ? p : sec === 'audience' ? a : h)[key] || '')}</textarea></label>`;
+      openModal(`
+        <h2 id="modal-title">导入预览 · ${esc(name)}</h2>
+        <p class="modal__lede">AI 从资料中抽取了以下内容（不可全信，请核对后写入）。仅非空字段会覆盖现有画像。</p>
+        <div class="imp-grid">
+          <div class="imp-sec"><h3>业务画像</h3>
+            ${field('行业', 'business', 'industry')}${field('服务区域', 'business', 'serviceArea')}${field('转化目标', 'business', 'conversionGoal')}
+          </div>
+          <div class="imp-sec"><h3>产品知识</h3>
+            ${field('产品名', 'product', 'productName')}${field('一句话介绍', 'product', 'description', 2)}${field('核心卖点(换行)', 'product', 'sellingPoints', 3)}${field('价格', 'product', 'priceRange')}${field('常见问答', 'product', 'faq', 3)}${field('禁用夸大词', 'product', 'forbiddenClaims')}
+          </div>
+          <div class="imp-sec"><h3>目标客户</h3>
+            ${field('客户群名称', 'audience', 'name')}${field('意向需求(逗号)', 'audience', 'needs')}${field('痛点(换行)', 'audience', 'painPoints', 3)}${field('意向关键词(逗号)', 'audience', 'intentKeywords')}${field('排除词(逗号)', 'audience', 'excludedKeywords')}
+          </div>
+          <div class="imp-sec"><h3>话术起草提示</h3>
+            ${field('评论区首触', 'scriptHints', 'comment', 2)}${field('欢迎语首句', 'scriptHints', 'welcome', 2)}${field('私信开场', 'scriptHints', 'private_message', 2)}${field('加微引导', 'scriptHints', 'wechat_guide', 2)}${field('异议应对', 'scriptHints', 'objection', 2)}
+          </div>
+        </div>
+        <label class="imp-toggle"><input type="checkbox" id="imp-draft" checked> 同时生成草稿话术（不自动启用）</label>
+        <div class="modal__foot">
+          <button type="button" class="btn" data-close>取消</button>
+          <button type="button" class="btn btn--primary" id="imp-apply">确认写入</button>
+        </div>`);
+      $('#imp-apply').addEventListener('click', async () => {
+        const btn = $('#imp-apply'); btn.disabled = true; btn.textContent = '写入中…';
+        const collect = (sec) => {
+          const o = {};
+          $$('[data-imp]', document).forEach((el) => {
+            const parts = el.dataset.imp.split('.');
+            if (parts[0] === sec) o[parts[1]] = el.value;
+          });
+          return o;
+        };
+        const payload = {
+          business: collect('business'),
+          product: collect('product'),
+          audience: collect('audience'),
+          scriptHints: collect('scriptHints'),
+          makeDraftScripts: $('#imp-draft').checked,
+        };
+        try {
+          const r = await API.applyImport(payload);
+          const ap = (r && r.applied) || {};
+          const n = (ap.scripts || []).length;
+          toast(`已写入：业务${ap.business ? '✓' : '·'} 产品${ap.product ? '✓' : '·'} 客户${ap.audience ? '✓' : '·'}${n ? ` 草稿话术${n}条` : ''}`, 'ok');
+          closeModal();
+          invalidateProfileCtx();
+          await renderBizConfigBody();
+        } catch (e) {
+          toast('写入失败：' + e.message, 'warn');
+          btn.disabled = false; btn.textContent = '确认写入';
+        }
+      });
+    }
+
+    // 业务画像页：挂载原「业务配置」5 步向导，与话术库同页切换
+    if (outerTab === 'business') {
       main.innerHTML = `
         <div class="view">
-          ${pageHead({
-            icon: 'script', title: '话术库', desc: '主话术 + 变体 AB 自动追踪，R2 命中自动切换（转化率 &lt; 8% 且样本 ≥ 30）',
-            actions: '<button type="button" class="btn btn--primary btn--sm" id="btn-new-script">+ 新建话术</button>',
-          })}
-
-          <div class="subtabs" role="tablist">
-            ${tabsHtml}
+          ${pageHead({ icon: 'i-script', title: '话术与业务配置', desc: '业务画像决定话术说什么；话术库存什么就用什么', actions: '<button type="button" class="btn btn--primary btn--sm" id="btn-import-material">📎 导入资料</button>' })}
+          <input type="file" id="mat-file" accept=".txt,.md,.docx,.xlsx,.pdf" hidden>
+          <div class="tabs" id="scripts-outer-tabs">
+            ${SCRIPT_OUTER_TABS.map((t) => `<button class="tab ${t.key === 'business' ? 'tab--active' : ''}" data-tab="${t.key}">${t.label}</button>`).join('')}
           </div>
+          ${bizConfigSkeletonHtml()}
+        </div>`;
+      $('#scripts-outer-tabs').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-tab]');
+        if (btn) location.hash = `#/scripts?tab=${btn.dataset.tab}`;
+      });
+      const matFile = $('#mat-file');
+      const matBtn = $('#btn-import-material');
+      if (matBtn && matFile) {
+        matBtn.addEventListener('click', () => matFile.click());
+        matFile.addEventListener('change', (e) => {
+          const f = e.target.files && e.target.files[0];
+          if (f) startMaterialImport(f);
+          matFile.value = '';
+        });
+      }
+      await renderBizConfigBody();
+      return;
+    }
+
+    let scripts = await API.getScripts();
+    const [templates, bizRaw, product, audience, wechatRaw, legacyRaw] = await Promise.all([
+      API.getScriptTemplates(),
+      API.getBusinessProfile ? API.getBusinessProfile().catch(() => ({})) : Promise.resolve({}),
+      API.getProductKnowledge ? API.getProductKnowledge().catch(() => ({})) : Promise.resolve({}),
+      API.getAudienceProfile ? API.getAudienceProfile().catch(() => ({})) : Promise.resolve({}),
+      API.getWeChatSettings ? API.getWeChatSettings().catch(() => ({})) : Promise.resolve({}),
+      API.getScriptStrategy ? API.getScriptStrategy().catch(() => ({})) : Promise.resolve({}),
+    ]);
+    const legacyStrategy = legacyRaw || {};   // 老 ScriptStrategy 四段文本，仅在「导入旧版话术」时用
+    const biz = bizRaw || {};
+    const _product = product || {};
+    const _audience = audience || {};
+    const _wechat = wechatRaw || {};
+    /* 变量解析上下文 = 业务画像的四张卡片，与下方「话术可用变量」一一对应 */
+    const _ctx = { business: biz, product: _product, audience: _audience, wechat: _wechat };
+    const _snap = profileKeySnapshot(biz, _product, _audience);
+    const staleScripts = scripts.filter((s) => isScriptStale(s, _snap));
+    const strategy = (window.API && window.API.fetchStrategySettings) ? await window.API.fetchStrategySettings().catch(() => null) : null;
+    const r2Threshold = (strategy && strategy.r2_switch_threshold != null) ? strategy.r2_switch_threshold : 8;
+
+    /* ── 场景就绪条（原「话术策略」卡片的功能，2026-09-13 迁到这里）──
+       5 类场景各有多少条话术 + 一键补缺 + 导入旧版四段文本。 */
+    /** 是否「通用话术」：完全没绑定业务画像变量（未引用任何 {变量}） */
+    function isGenericScript(s) {
+      if (!s) return true;
+      const allText = ((s.variants || []).map((v) => v.text).join('\n')) + '\n' + (s.welcomeMsg || '');
+      return detectUsedVars(allText).length === 0;
+    }
+    /** 是否「有效话术」：非通用 + 有变体发出样本 ≥ 30 且加微转化率 ≥ R2 阈值 */
+    function isScriptEffective(s) {
+      if (!s || isGenericScript(s)) return false;
+      const good = (s.variants || []).filter((v) => v.status === 'active' && (v.sent || 0) >= 30);
+      return good.some((v) => v.convRate != null && v.convRate >= r2Threshold);
+    }
+    /** 是否「绑定画像」：引用了业务画像变量，且这些变量在画像里都已填写。
+        只填了通用兜底话术（不引用任何变量，或引用的变量还没填）不算就绪。 */
+    function isScriptBound(s) {
+      if (!s) return false;
+      const allText = ((s.variants || []).map((v) => v.text).join('\n')) + '\n' + (s.welcomeMsg || '');
+      const used = detectUsedVars(allText);
+      if (used.length === 0) return false; // 通用兜底话术，未绑定画像
+      return used.every((k) => {
+        const v = SCRIPT_VARS.find((x) => x.key === k);
+        return v && String(v.get(_ctx) || '').trim() !== '';
+      });
+    }
+
+    const sceneStats = () => {
+      const stat = {};
+      SCRIPT_SCENE_CATS.forEach((c) => { stat[c.key] = { n: 0, v: 0, eff: 0, bound: 0 }; });
+      scripts.forEach((s) => {
+        const c = stat[s.category];
+        if (!c) return;
+        c.n += 1;
+        c.v += ((s.variants || []).filter((x) => x.status === 'active')).length;
+        if (isScriptEffective(s)) c.eff += 1;
+        if (isScriptBound(s)) c.bound += 1;
+      });
+      const missing = SCRIPT_SCENE_CATS.filter((c) => stat[c.key].n === 0);
+      const generic = SCRIPT_SCENE_CATS.filter((c) => stat[c.key].n > 0 && stat[c.key].bound === 0);
+      const needGen = missing.concat(generic);
+      const legacyItems = Object.keys(SCRIPT_LEGACY_MAP)
+        .filter((k) => String((legacyStrategy || {})[k] || '').trim() && stat[SCRIPT_LEGACY_MAP[k]].n === 0);
+      return { stat, missing, generic, needGen, legacyItems, ready: SCRIPT_SCENE_CATS.length - needGen.length };
+    };
+
+    /** 话术库顶部状态条：把原来各占一行的「刷新横幅 + 有效就绪条 + 业务上下文条」压成一行。
+        左：就绪药丸（悬停看缺哪几类）；中：业务上下文；右：待办按钮。 */
+    function scrBarHtml() {
+      const { stat, needGen, generic, legacyItems } = sceneStats();
+      const readyCats = SCRIPT_SCENE_CATS.filter((c) => stat[c.key].bound > 0).length;
+      const allOk = needGen.length === 0;
+      const needLabel = needGen.map((c) => c.label).join('、');
+      const genericLabel = generic.map((c) => c.label).join('、');
+      // 原来占第二行的说明句，收进药丸的悬停提示
+      const readyTip = allOk
+        ? '每类场景都有绑定业务画像的有效话术，可直接取用。'
+        : (genericLabel
+          ? genericLabel + ' 的话术还是通用的，填完业务画像会更有针对性。'
+          : '还差 ' + needLabel + ' 没有话术，点右侧「按画像生成」补上。');
+      const hasCtx = !!(biz.industry || _product.productName);
+      const ctxTxt = hasCtx
+        ? [biz.industry || '未填行业', _product.productName, biz.serviceArea,
+           _audience.name ? '面向 ' + _audience.name : '',
+           biz.conversionGoal ? '目标' + biz.conversionGoal : ''].filter(Boolean).join(' · ')
+        : '还没填业务画像，AI 生成的话术会缺少针对性';
+      return `
+        <div class="scr-bar${hasCtx ? '' : ' scr-bar--empty'}">
+          <span class="scr-chip${allOk ? ' is-ok' : ''}" title="${esc(readyTip)}">
+            <i class="scr-chip__dot"></i>有效话术就绪 <b>${readyCats}/${SCRIPT_SCENE_CATS.length}</b>
+          </span>
+          <span class="scr-bar__ctx" title="${esc('业务上下文：' + ctxTxt)}">业务上下文：<b>${esc(ctxTxt)}</b></span>
+          <span class="scr-bar__sp"></span>
+          ${staleScripts.length ? `<button type="button" class="btn btn--warn btn--sm" id="btn-refresh-gen" title="业务画像已更新，${staleScripts.length} 条「画像生成」话术可能过时，建议刷新以对齐最新画像">⚠ ${staleScripts.length} 条待刷新</button>` : ''}
+          ${legacyItems.length ? `<button type="button" class="btn btn--sm" id="scr-import">导入旧版话术（${legacyItems.length} 类）</button>` : ''}
+          ${needGen.length ? `<button type="button" class="btn btn--primary btn--sm" id="scr-gen" title="${esc('缺：' + needLabel)}">按画像生成 / 优化 ${needGen.length} 类</button>` : ''}
+          <a class="btn btn--sm" href="#/scripts?tab=business">${hasCtx ? '完善业务画像' : '去填业务画像'}</a>
+        </div>`;
+    }
+
+    const mountHtml = () => {
+      const cat = scriptTabState.category;
+      // 先按分类筛 → 再按「变量下拉里选的画像可选值」筛 → 「点名」只显示被点中的那一条（定位高亮）
+      const byCat = cat === 'all' ? scripts : scripts.filter((s) => s.category === cat);
+      const pickVal = scriptTabState.val;
+      const byVal = (pickVal && pickVal.k) ? byCat.filter((s) => scriptMatchVal(s, pickVal)) : byCat;
+      const focusId = scriptTabState.focusId;
+      const filtered = focusId && byVal.some((s) => s.id === focusId)
+        ? byVal.filter((s) => s.id === focusId)
+        : byVal;
+      return `
+          ${scrBarHtml()}
+
+          ${varFilterHtml(_ctx, byCat, focusId, pickVal, scripts)}
 
           ${filtered.length > 0 ? `
           <div class="grid grid--2">
-            ${filtered.map((s) => scriptCard(s)).join('')}
+            ${filtered.map((s) => scriptCard(s, r2Threshold)).join('')}
           </div>` : `
           <div class="card"><div class="empty">
             <span class="empty__ico">${ico('empty')}</span>
-            <p>该分类下暂无话术</p>
-          </div></div>`}
+            <p>${pickVal && pickVal.k
+              ? `没有用得上「${esc(pickVal.v)}」的话术（正文写到这个值，或引用 {${esc(pickVal.k)}}）。点上面下拉换一个值，或「清除筛选」看全部。`
+              : '该分类下暂无话术'}</p>
+          </div></div>`}`;
+    };
 
-          <div class="card">
-            <div class="card__head">
-              <span class="card__title">行业话术模板包</span>
-              <span class="card__hint">H3 验证：v1.0 内置装修包，上线后用行业分布数据复核</span>
-            </div>
-            <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
-              ${templates.map((t) => `
-                <div style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;${t.installed ? 'background:var(--brand-tint-2)' : ''}">
-                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-                    <strong>${esc(t.industry)}</strong>
-                    ${t.installed ? '<span class="tag tag--wechat">已安装</span>' : '<span class="tag tag--low">未开放</span>'}
+    main.innerHTML = `
+      <div class="view">
+        ${pageHead({
+          icon: 'script', title: '话术与业务配置',
+          desc: `主话术 + 变体按权重随机分配，发出后按配置权重分发流量`,
+          actions: '<button type="button" class="btn btn--primary btn--sm" id="btn-new-script">+ 新建话术</button>',
+        })}
+        <div class="tabs" id="scripts-outer-tabs">
+          ${SCRIPT_OUTER_TABS.map((t) => `<button class="tab ${t.key === 'scripts' ? 'tab--active' : ''}" data-tab="${t.key}">${t.label}</button>`).join('')}
+        </div>
+        <div id="scripts-body"></div>
+      </div>`;
+    $('#scripts-outer-tabs').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tab]');
+      if (btn) location.hash = `#/scripts?tab=${btn.dataset.tab}`;
+    });
+
+    /** 画像变更后刷新生成话术：旧→新差异预览，确认才覆盖（仅 source=generated 参与）。走 AI 重算。 */
+    async function openRefreshDiff(staleList, snap, bizP, productP, audienceP) {
+      openModal(`<h2 id="modal-title">刷新生成的话术（旧 → 新）</h2><p class="modal__lede">正在按当前业务画像用 AI 重新生成…</p>`);
+      let preview;
+      try {
+        preview = await API.generateScriptPreview();
+      } catch (e) {
+        openModal(`<h2 id="modal-title">刷新失败</h2><p class="modal__lede">AI 生成出错：${esc(e.message)}</p><div class="modal__foot"><button type="button" class="btn btn--primary" data-close>关闭</button></div>`);
+        return;
+      }
+      const scenes = (preview && preview.scenes) || {};
+      const newSnap = (preview && preview.snapshot) || JSON.stringify(snap);
+      const rows = staleList.map((s) => {
+        const newTexts = scenes[s.category] || [];
+        const oldTexts = (s.variants || []).map((v) => v.text);
+        const max = Math.max(oldTexts.length, newTexts.length);
+        const diffs = [];
+        for (let i = 0; i < max; i++) {
+          diffs.push({ idx: String.fromCharCode(65 + i), old: oldTexts[i] || '（无）', ne: newTexts[i] || '（保留原变体）' });
+        }
+        return { name: s.name, category: s.category, id: s.id, variants: s.variants || [], diffs };
+      });
+      openModal(`
+        <h2 id="modal-title">刷新生成的话术（旧 → 新）</h2>
+        <p class="modal__lede">以下话术基于<b>当前业务画像</b>由 AI 重新生成。确认后覆盖旧文案并回写新快照；手写改动会被覆盖，请确认。</p>
+        <div class="diff-list">
+          ${rows.map((r) => `
+            <div class="diff-card">
+              <div class="diff-card__title">${esc(r.name)}</div>
+              ${r.diffs.map((d) => `
+                <div class="diff-row">
+                  <span class="diff-row__tag">变体 ${d.idx}</span>
+                  <div class="diff-row__cols">
+                    <div class="diff-old"><b>旧</b>${esc(d.old)}</div>
+                    <div class="diff-new"><b>新</b>${esc(d.ne)}</div>
                   </div>
-                  <div style="font-size:12px;color:var(--ink-soft)">${esc(t.desc)}</div>
                 </div>`).join('')}
-            </div>
-          </div>
-        </div>`;
+            </div>`).join('')}
+        </div>
+        <div class="modal__foot">
+          <button type="button" class="btn" data-close>取消</button>
+          <button type="button" class="btn btn--primary" id="diff-confirm">确认刷新 ${staleList.length} 条</button>
+        </div>`);
+      $('#diff-confirm').addEventListener('click', async () => {
+        const btn = $('#diff-confirm');
+        btn.disabled = true; btn.textContent = '刷新中…';
+        try {
+          for (const r of rows) {
+            const newTexts = scenes[r.category] || [];
+            for (let i = 0; i < r.variants.length; i++) {
+              const ne = newTexts[i];
+              if (ne == null) continue;
+              await API.updateScriptVariant(r.id, r.variants[i].variantId, { text: ne });
+            }
+            for (let i = r.variants.length; i < newTexts.length; i++) {
+              await API.addScriptVariant(r.id, { variantId: String.fromCharCode(65 + i), text: newTexts[i], weight: 1 });
+            }
+            await API.updateScript(r.id, { source: 'generated', generatedFrom: newSnap });
+          }
+          toast(`已刷新 ${staleList.length} 条话术`, 'ok');
+          closeModal();
+          scripts = await API.getScripts();
+          render();
+        } catch (e) {
+          toast('刷新失败：' + e.message, 'warn');
+          btn.disabled = false; btn.textContent = '确认刷新';
+        }
+      });
+    }
+
+    function render() {
+      const body = $('#scripts-body');
+      if (body) body.innerHTML = mountHtml();
+      bind();
+    }
+
+    function bind() {
+      const body = $('#scripts-body');
+      if (!body) return;
 
       // Tab 切换事件
-      $$('.subtab-btn', main).forEach((btn) => {
+      $$('.subtab-btn', body).forEach((btn) => {
         btn.addEventListener('click', () => {
           scriptTabState.category = btn.dataset.cat;
+          scriptTabState.focusId = null; // 切分类后点名的话术可能不在新分类里，直接回到全部
           render();
         });
       });
 
-      $('#btn-new-script').addEventListener('click', () => {
-        openModal(`
-          <h2 id="modal-title">新建话术</h2>
-          <div class="field"><label for="ns-name">话术名称</label><input type="text" id="ns-name" placeholder="例：装修 · 报价跟进"></div>
-          <div class="field"><label for="ns-cat">话术分类</label>
-            <select id="ns-cat">
-              <option value="comment">评论话术</option>
-              <option value="private_message">私信话术</option>
-              <option value="wechat_guide">微信引导</option>
-              <option value="objection">异议处理</option>
-              <option value="nurture">培育SOP</option>
-            </select></div>
-          <div class="field"><label for="ns-text">话术内容</label>
-            <textarea id="ns-text" placeholder="支持变量：{视频标题} {预算/面积} {需求关键词}"></textarea>
-            <span class="field__hint">建议同时准备 ≥2 个变体用于 AB 追踪（R2 规则）</span></div>
-          <div class="modal__foot">
-            <button type="button" class="btn" data-close>取消</button>
-            <button type="button" class="btn btn--primary" id="ns-save" data-close>创建（演示态）</button>
-          </div>`);
-        $('#ns-save').addEventListener('click', () => toast('话术已创建（演示态，未落库）'));
+      // 话术可用变量 → 点 chip 弹下拉列出用到它的话术；点选某条 = 定位高亮
+      const closeAllVchips = (except) => {
+        $$('.vsel-wrap.is-open', body).forEach((w) => { if (w !== except) { w.classList.remove('is-open'); const p = w.querySelector('[data-vpanel]'); if (p) p.hidden = true; } });
+      };
+      $$('[data-vchip]', body).forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const wrap = btn.closest('.vsel-wrap');
+          const panel = wrap && wrap.querySelector('[data-vpanel]');
+          if (!wrap || !panel) return;
+          const willOpen = panel.hidden;
+          closeAllVchips(wrap);
+          panel.hidden = !willOpen;
+          wrap.classList.toggle('is-open', willOpen);
+          btn.setAttribute('aria-expanded', String(willOpen));
+          if (willOpen) {
+            // 靠右时右对齐，避免面板溢出屏幕
+            panel.style.right = ''; panel.style.left = '';
+            const r = panel.getBoundingClientRect();
+            if (r.right > window.innerWidth - 12) { panel.style.left = 'auto'; panel.style.right = '0'; }
+            const item = panel.querySelector('.vpick__item.is-cur');
+            if (item) item.scrollIntoView({ block: 'nearest' });
+          }
+        });
       });
+      // 点面板里的「画像可选值」→ 拿这个值筛下面的话术卡片；再点同一个值 = 取消筛选
+      $$('[data-vopt]', body).forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const k = btn.dataset.vkey;
+          const v = btn.dataset.vopt;
+          const cur = scriptTabState.val;
+          scriptTabState.val = (cur && cur.k === k && cur.v === v) ? null : { k, v };
+          scriptTabState.focusId = null;   // 换筛选条件时取消点名，否则只剩被点名那条
+          closeAllVchips();
+          render();
+        });
+      });
+      // 点面板里的话术 → 只显示这一条 + 滚动定位 + 高亮闪烁
+      $$('[data-vgoto]', body).forEach((item) => {
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          scriptTabState.focusId = item.dataset.vgoto;
+          scriptTabState.val = null;       // 点名具体某条时先解除值筛选，别把它自己筛掉
+          scriptTabState._scrollPending = true;
+          closeAllVchips();
+          render();
+        });
+      });
+      // 点变量卡外部关闭所有下拉（只绑一次）
+      if (!body.dataset.vchipDocBound) {
+        body.dataset.vchipDocBound = '1';
+        document.addEventListener('click', (e) => {
+          if (e.target.closest && e.target.closest('.vsel-wrap')) return;
+          $$('.vsel-wrap.is-open', body).forEach((w) => { w.classList.remove('is-open'); const p = w.querySelector('[data-vpanel]'); if (p) p.hidden = true; });
+        });
+      }
+      const vclear = $('[data-vclear]', body);
+      if (vclear) vclear.addEventListener('click', () => { scriptTabState.focusId = null; scriptTabState.val = null; render(); });
+
+      // 从变量下拉点名过来：滚到那张卡并闪烁提示
+      if (scriptTabState._scrollPending) {
+        scriptTabState._scrollPending = false;
+        const target = $('[data-script-id="' + CSS.escape(scriptTabState.focusId || '') + '"]', body);
+        if (target) {
+          try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) { target.scrollIntoView(); }
+          target.classList.remove('is-flash');
+          void target.offsetWidth; // 重启动画
+          target.classList.add('is-flash');
+        }
+      }
+
+      // 话术卡「AI 优化」：勾选画像变量 → AI 改写 → 草稿确认 → 落库
+      $$('[data-script-ai]', body).forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const target = scripts.find((x) => x.id === btn.dataset.scriptAi);
+          if (!target) { toast('找不到这条话术，刷新试试', 'warn'); return; }
+          openScriptAiDialog(target, async () => {
+            scripts = await API.getScripts();
+            render();
+          });
+        });
+      });
+
+      // 话术卡「编辑」：改名/分类/备注/欢迎语/启用 + 变体增删改
+      $$('[data-script-edit]', body).forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.scriptEdit;
+          const target = scripts.find((x) => x.id === id);
+          if (!target) { toast('找不到这条话术，刷新试试', 'warn'); return; }
+          openScriptEditModal(target, async () => {
+            scripts = await API.getScripts();
+            render();
+          });
+        });
+      });
+
+      // 变体行：点击展开 / 收起全文（默认 1 行截断）
+      $$('.svrow', body).forEach((row) => {
+        if (!row.querySelector('.svrow__text') || row.classList.contains('svrow--empty')) return;
+        row.addEventListener('click', (e) => {
+          if (e.target.closest('button')) return;
+          row.classList.toggle('is-open');
+        });
+      });
+
+      // 话术卡「用画像解析预览」：实时把 {变量} 替换为当前画像值
+      $$('[data-script-preview]', body).forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.scriptPreview;
+          const card = btn.closest('.script-card');
+          const prev = $('#scr-prev-' + id, body);
+          if (!card || !prev) return;
+          if (!prev.hidden) { prev.hidden = true; prev.innerHTML = ''; btn.textContent = '预览'; return; }
+          const ctx = await ensureProfileCtx();
+          const raws = $$('[data-raw]', card);
+          const lines = raws.map((el) => {
+            const raw = el.getAttribute('data-raw') || el.textContent;
+            return resolveProfileVars(raw, ctx);
+          }).filter((t) => t && t.trim());
+          const missing = detectUsedVars(raws.map((el) => el.getAttribute('data-raw') || '').join('\n'));
+          prev.innerHTML = (lines.length ? lines.map((t) => `<div class="scr-preview__line">${esc(t).replace(/\n/g, '<br>')}</div>`).join('') : '<div class="muted">该话术未使用变量</div>')
+            + (missing.length ? `<div class="scr-preview__miss">未填充：${missing.map((k) => '{' + esc(k) + '}').join(' ')} — 去「业务画像」补填后自动生效</div>` : '');
+          prev.hidden = false;
+          btn.textContent = '收起预览';
+        });
+      });
+
+      // 场景就绪条：按画像一键补齐缺失场景（AI 生成）
+      const scrGen = $('#scr-gen', body);
+      if (scrGen) scrGen.addEventListener('click', async () => {
+        const old = scrGen.textContent;
+        scrGen.disabled = true;
+        scrGen.textContent = 'AI 生成中…（约 10-60s）';
+        try {
+          const res = await API.generateScriptByProfile();
+          const scenes = (res && res.scenes) || {};
+          const total = Object.values(scenes).reduce((a, b) => a + (b || 0), 0);
+          toast(total ? `AI 已生成 / 刷新 ${total} 条话术，可直接改写` : '没有可生成的话术', total ? 'ok' : '');
+          invalidateProfileCtx();
+          scripts = await API.getScripts();
+          render();
+        } catch (e) {
+          toast('AI 生成失败：' + e.message, 'warn');
+          scrGen.disabled = false; scrGen.textContent = old;
+        }
+      });
+
+      // 场景就绪条：导入旧版 ScriptStrategy 四段文本（一次性迁移）
+      const scrImp = $('#scr-import', body);
+      if (scrImp) scrImp.addEventListener('click', async () => {
+        scrImp.disabled = true; scrImp.textContent = '导入中…';
+        try {
+          const { legacyItems } = sceneStats();
+          let n = 0;
+          for (const k of legacyItems) {
+            const cat = SCRIPT_LEGACY_MAP[k];
+            const texts = splitLines(legacyStrategy[k]);
+            if (!texts.length) continue;
+            const label = (SCRIPT_SCENE_CATS.find((c) => c.key === cat) || {}).label || cat;
+            const created = await API.createScript({
+              name: `旧版话术 · ${label}`, category: cat, industry: biz.industry || '通用',
+              intro: '从旧版话术策略导入',
+            });
+            const sid = created && (created.id || created.scriptId);
+            if (!sid) continue;
+            const w = Math.max(1, Math.round(100 / texts.length));
+            for (let j = 0; j < texts.length; j++) {
+              await API.addScriptVariant(sid, { variantId: ('ABC'[j] || ('V' + (j + 1))), text: texts[j], weight: w });
+            }
+            n += 1;
+          }
+          toast(n ? `已导入 ${n} 类旧话术到话术库` : '没有可导入的内容', n ? 'ok' : '');
+          scripts = await API.getScripts();
+          render();
+        } catch (e) {
+          toast('导入失败：' + e.message, 'warn');
+          scrImp.disabled = false; scrImp.textContent = '导入旧版话术';
+        }
+      });
+
+      // P2：画像变更后刷新「画像生成」话术（旧→新差异预览，确认才覆盖）
+      const refreshBtn = $('#btn-refresh-gen', body);
+      if (refreshBtn) {
+        refreshBtn.addEventListener('click', async () => {
+          await openRefreshDiff(staleScripts, _snap, biz, _product, _audience);
+        });
+      }
+
+    $('#btn-new-script').addEventListener('click', () => {
+      const catOrder = scriptTabState.category === 'all' ? 'comment' : scriptTabState.category;
+      /* 芯片与「业务画像」同源：按画像四张卡片分组，鼠标悬停显示该字段当前值 */
+      const varChips = varChipsHtml(_ctx);
+
+      /* ════ 新建话术：默认走「AI 读业务画像出候选 → 勾选/改写 → 入库」════
+         一次 generate-preview 会返回全部 5 类场景，缓存在内存里：
+         切分类直接复用，不用每切一次就再等一轮 AI（单轮 10~60s）。 */
+      let mode = 'ai';
+      let draftCache = null;      // { scenes: {cat: [text]}, snapshot }
+      let nameTouched = false;
+
+      const CAT_OPTS = SCRIPT_SCENE_CATS.map((c) =>
+        `<option value="${c.key}"${catOrder === c.key ? ' selected' : ''}>${esc(c.label)}</option>`).join('');
+
+      const defaultName = (cat) => {
+        const label = (SCRIPT_SCENE_CATS.find((c) => c.key === cat) || {}).label || '话术';
+        return `${label} · ${biz.industry || '通用'}`;
+      };
+
+      /** AI 会读到的画像要点；没填的标出来 —— 空太多生成出来的话术会很泛 */
+      function srcHtml() {
+        const items = [
+          ['行业', biz.industry], ['产品', _product.productName],
+          ['卖点', splitLines(_product.sellingPoints)[0]], ['价格', _product.priceRange],
+          ['区域', biz.serviceArea], ['目标客户', biz.targetCustomer],
+          ['痛点', splitLines(_audience.painPoints)[0]], ['加微理由', _wechat.guideReason],
+        ];
+        const filled = items.filter((x) => String(x[1] || '').trim()).length;
+        return `<div class="ns-src${filled ? '' : ' is-empty'}">
+          <b>AI 会读这些画像信息</b>
+          <div class="ns-src__list">${items.map(([k, v]) => {
+            const has = String(v || '').trim();
+            return `<span class="ns-src__i${has ? '' : ' is-miss'}">${esc(k)}：${esc(has || '未填')}</span>`;
+          }).join('')}</div>
+          ${filled >= 3 ? '' : '<span class="ns-src__warn">画像填得太少，生成的话术会很泛。建议先补齐业务画像必填项再生成。</span>'}
+        </div>`;
+      }
+
+      function draftHtml(list) {
+        if (!list || !list.length) return '<div class="muted">这一类没生成出内容，点「换一批」再试。</div>';
+        return list.map((t, i) => `
+          <div class="ns-draft">
+            <label class="ns-draft__pick">
+              <input type="checkbox" data-pick checked>
+              变体 ${String.fromCharCode(65 + i)}
+            </label>
+            <textarea class="ns-draft__text" data-text rows="2">${esc(t)}</textarea>
+          </div>`).join('');
+      }
+
+      function renderDrafts() {
+        const box = $('#ns-drafts');
+        if (!box) return;
+        const cat = $('#ns-cat').value;
+        if (!draftCache) {
+          box.innerHTML = '<div class="muted">点「生成候选」，AI 会按上面的画像写出 1~3 条，可勾选、可改写。</div>';
+          return;
+        }
+        box.innerHTML = draftHtml((draftCache.scenes || {})[cat] || []);
+      }
+
+      async function runGen(force) {
+        const cat = $('#ns-cat').value;
+        const tip = $('#ns-ai-tip');
+        const genBtn = $('#ns-gen');
+        const regenBtn = $('#ns-regen');
+        // 已生成过且该类有内容：复用缓存，不重复等 AI
+        if (!force && draftCache && ((draftCache.scenes || {})[cat] || []).length) { renderDrafts(); return; }
+        if (genBtn) { genBtn.disabled = true; genBtn.textContent = '生成中…'; }
+        if (regenBtn) regenBtn.disabled = true;
+        if (tip) tip.textContent = '正在读业务画像并生成（约 10-60s），别关这个窗口';
+        try {
+          const res = await API.generateScriptPreview();
+          draftCache = {
+            scenes: (res && res.scenes) || {},
+            snapshot: (res && res.snapshot) || JSON.stringify(_snap),
+          };
+          if (regenBtn) regenBtn.hidden = false;
+          renderDrafts();
+          if (tip) tip.textContent = '勾掉不要的、改改就能存';
+        } catch (err) {
+          const raw = (err && err.message) || String(err);
+          // 上游错误翻成人话：余额/额度/Key 失效最常见，别把 502 原文丢给用户
+          const human = /INSUFFICIENT_BALANCE|余额|quota|HTTP 40[13]/.test(raw)
+            ? 'AI 账号余额不足或 Key 失效 → 去「设置」页的 AI 配置检查 / 充值'
+            : (/未配置|HTTP 503|no api key/i.test(raw)
+              ? '还没配 AI 服务 → 去「设置」页填 Provider 和 Key'
+              : raw);
+          if (tip) tip.textContent = human;
+          toast(human, 'warn');
+        } finally {
+          if (genBtn) { genBtn.disabled = false; genBtn.textContent = '生成候选'; }
+          if (regenBtn) regenBtn.disabled = false;
+        }
+      }
+
+      openModal(`
+        <h2 id="modal-title">新建话术</h2>
+        <p class="modal__lede">让 AI 读业务画像生成候选，勾选后微调即可入库；也可以切到「自己写」。</p>
+        <div class="ns-grid">
+          <div class="field"><label for="ns-cat">话术分类</label><select id="ns-cat">${CAT_OPTS}</select></div>
+          <div class="field"><label for="ns-name">话术名称</label><input type="text" id="ns-name" value="${esc(defaultName(catOrder))}"></div>
+        </div>
+        <div class="ns-mode" id="ns-mode">
+          <button type="button" class="ns-mode__b is-on" data-mode="ai">AI 按画像生成</button>
+          <button type="button" class="ns-mode__b" data-mode="manual">自己写</button>
+        </div>
+        <div id="ns-ai">
+          ${srcHtml()}
+          <div class="ns-ai-acts">
+            <button type="button" class="btn btn--primary btn--sm" id="ns-gen">生成候选</button>
+            <button type="button" class="btn btn--sm" id="ns-regen" hidden>换一批</button>
+            <span class="ns-ai-tip" id="ns-ai-tip"></span>
+          </div>
+          <div id="ns-drafts"><div class="muted">点「生成候选」，AI 会按上面的画像写出 1~3 条，可勾选、可改写。</div></div>
+        </div>
+        <div id="ns-manual" hidden>
+          <div class="field">
+            <label for="ns-text">首个变体内容（A）</label>
+            <div class="var-chips" id="ns-var-chips">${varChips}</div>
+            <textarea id="ns-text" placeholder="例：你好，看到你在关注{产品}。我们是做{行业}的，{卖点}。"></textarea>
+            <span class="field__hint">变量取自业务画像（鼠标悬停看当前值），点击插入；发送时按当前业务画像实时填充。建议再补 ≥1 个变体做 AB 追踪（R2 规则）。</span>
+          </div>
+          <div class="field"><label for="ns-intro">备注（选填）</label><input type="text" id="ns-intro" placeholder="例：报价后 24 小时内跟进"></div>
+          <div class="ns-preview" id="ns-preview-wrap">
+            <span class="ns-preview__label">按当前画像解析预览</span>
+            <div class="ns-preview__body" id="ns-preview"><span class="muted">输入内容后，这里显示按当前画像解析的效果</span></div>
+          </div>
+        </div>
+        <div class="modal__foot">
+          <button type="button" class="btn" data-close>取消</button>
+          <button type="button" class="btn btn--primary" id="ns-save">入库</button>
+        </div>`, { wide: true });
+
+      // 模式切换
+      $$('#ns-mode .ns-mode__b').forEach((b) => b.addEventListener('click', () => {
+        mode = b.dataset.mode;
+        $$('#ns-mode .ns-mode__b').forEach((x) => x.classList.toggle('is-on', x === b));
+        $('#ns-ai').hidden = mode !== 'ai';
+        $('#ns-manual').hidden = mode !== 'manual';
+        const save = $('#ns-save');
+        if (save) save.textContent = mode === 'ai' ? '入库' : '创建';
+      }));
+
+      // 分类切换：自动带出默认名（用户改过就不覆盖），并切到该类的候选
+      const nsCat = $('#ns-cat');
+      if (nsCat) nsCat.addEventListener('change', () => {
+        if (!nameTouched) $('#ns-name').value = defaultName(nsCat.value);
+        renderDrafts();
+      });
+      const nsName = $('#ns-name');
+      if (nsName) nsName.addEventListener('input', () => { nameTouched = true; });
+
+      const genBtn = $('#ns-gen');
+      if (genBtn) genBtn.addEventListener('click', () => runGen(false));
+      const regenBtn = $('#ns-regen');
+      if (regenBtn) regenBtn.addEventListener('click', () => runGen(true));
+
+      // 手动模式的变量芯片与解析预览（沿用原逻辑）
+      const nsText = $('#ns-text');
+      const nsPreview = $('#ns-preview');
+      async function updateNsPreview() {
+        if (!nsText || !nsPreview) return;
+        const ctx = await ensureProfileCtx();
+        const raw = nsText.value;
+        nsPreview.innerHTML = raw
+          ? resolveProfileVars(raw, ctx).replace(/\n/g, '<br>')
+          : '<span class="muted">输入内容后，这里显示按当前画像解析的效果</span>';
+      }
+      if (nsText) nsText.addEventListener('input', updateNsPreview);
+      $$('#ns-var-chips .var-chip').forEach((chip) => {
+        chip.addEventListener('click', () => {
+          if (!nsText) return;
+          const tok = '{' + chip.dataset.var + '}';
+          const s = nsText.selectionStart || 0, e = nsText.selectionEnd || 0;
+          nsText.value = nsText.value.slice(0, s) + tok + nsText.value.slice(e);
+          nsText.selectionStart = nsText.selectionEnd = s + tok.length;
+          nsText.focus();
+          updateNsPreview();
+        });
+      });
+      updateNsPreview();
+
+      $('#ns-save').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const name = $('#ns-name').value.trim();
+        const category = $('#ns-cat').value;
+        if (!name) { toast('请填写话术名称', 'warn'); if ($('#ns-name')) $('#ns-name').focus(); return; }
+
+        let texts = [];
+        if (mode === 'ai') {
+          texts = $$('#ns-drafts .ns-draft')
+            .filter((d) => { const cb = d.querySelector('[data-pick]'); return cb && cb.checked; })
+            .map((d) => { const t = d.querySelector('[data-text]'); return t ? t.value.trim() : ''; })
+            .filter(Boolean);
+          if (!texts.length) {
+            toast(draftCache ? '至少勾选一条候选' : '先点「生成候选」让 AI 出内容', 'warn');
+            return;
+          }
+        } else {
+          const t = nsText ? nsText.value.trim() : '';
+          if (!t) { toast('请填写变体内容', 'warn'); if (nsText) nsText.focus(); return; }
+          texts = [t];
+        }
+
+        btn.disabled = true;
+        try {
+          const created = await API.createScript({
+            name, category,
+            intro: mode === 'ai'
+              ? `AI 按业务画像生成，人工确认（${texts.length} 个变体）`
+              : ($('#ns-intro') ? $('#ns-intro').value.trim() : ''),
+            industry: biz.industry || '通用',
+            // 标成 generated 并回写快照：画像改了才会进「建议刷新」横幅
+            source: mode === 'ai' ? 'generated' : 'manual',
+            generatedFrom: mode === 'ai' ? ((draftCache && draftCache.snapshot) || JSON.stringify(_snap)) : '',
+          });
+          const sid = created && (created.id || created.scriptId);
+          if (!sid) throw new Error('创建成功但未返回话术 ID');
+          const W = [100, 70, 50];
+          for (let i = 0; i < texts.length; i++) {
+            await API.addScriptVariant(sid, { variantId: String.fromCharCode(65 + i), text: texts[i], weight: W[i] || 50 });
+          }
+          invalidateProfileCtx();
+          toast(`话术已创建（${texts.length} 个变体）`, 'ok');
+          closeModal();
+          scripts = await API.getScripts();
+          scriptTabState.category = category;
+          render();
+        } catch (err) {
+          toast('创建失败：' + err.message, 'warn');
+          btn.disabled = false;
+        }
+      });
+    });
     }
 
     render();
@@ -4622,6 +6010,190 @@
   }
 
   /* 回复话术选择弹窗 */
+  /* ═══════════════════════════════════════════
+     批量回复：把选中的评论任务逐条真实发送到抖音
+     每条先取内容（按权重自动挑 / 指定话术变体），再调 /comments/execute(confim=true)
+     ═══════════════════════════════════════════ */
+  function openBatchReplyModal(ids, commentScripts, allTasks) {
+    const tasks = ids.map((id) => allTasks.find((t) => t.id === id)).filter(Boolean);
+    if (!tasks.length) { toast('没有选中任何待回复评论', 'warn'); return; }
+
+    // mode: auto=每条各自按权重挑 / script=所有条用同一条指定变体
+    let mode = 'auto';
+    let scriptId = null;
+    let variantId = null;
+    let interval = 8;          // 每条之间的间隔秒数，降低频控风险
+    let running = false;
+    let finished = false;
+    let results = [];          // { task, ok, msg, text }
+    let stopped = false;
+
+    const variantsOf = (s) => ((s && s.variants) || []).filter((v) => v.status === 'active');
+    const chosenScript = () => commentScripts.find((s) => s.id === scriptId) || null;
+    const chosenVariant = () => variantsOf(chosenScript()).find((v) => v.id === variantId) || null;
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    function render() {
+      const okN = results.filter((r) => r.ok).length;
+      const body = !running && !finished
+        ? pickHtml()
+        : progressHtml(okN);
+      const foot = !running && !finished
+        ? `<button type="button" class="btn" data-close>取消</button>
+           <button type="button" class="btn btn--primary" id="bstart" ${mode === 'script' && !chosenVariant() ? 'disabled' : ''}>开始发送 ${tasks.length} 条</button>`
+        : (running
+          ? `<button type="button" class="btn" id="bstop">停止（发完当前这条）</button>`
+          : `<button type="button" class="btn btn--primary" data-close>完成并刷新</button>`);
+      openModal(`
+        <h2 id="modal-title">批量回复 ${tasks.length} 条评论</h2>
+        <p class="modal__lede">逐条真实提交到抖音，请保持自动化浏览器已启动并登录。每条之间间隔 ${interval} 秒。</p>
+        ${body}
+        <div class="modal__foot">${foot}</div>`);
+
+      if (!running && !finished) bindPick();
+      else if (running) $('#bstop')?.addEventListener('click', () => { stopped = true; });
+      else $$('[data-close]').forEach((b) => b.addEventListener('click', () => route()));
+    }
+
+    function pickHtml() {
+      return `
+        <div class="field">
+          <label>回复内容来源</label>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:4px">
+            <label style="display:inline-flex;align-items:center;gap:5px;font-weight:400">
+              <input type="radio" name="bmode" value="auto" ${mode === 'auto' ? 'checked' : ''}> 按权重自动挑（每条各挑一条，最不容易重复）
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:5px;font-weight:400">
+              <input type="radio" name="bmode" value="script" ${mode === 'script' ? 'checked' : ''}> 指定同一条话术变体
+            </label>
+          </div>
+        </div>
+        ${mode === 'script' ? `
+        <div class="field">
+          <label for="bscript">选择话术</label>
+          <select id="bscript">
+            <option value="">— 请选择 —</option>
+            ${commentScripts.map((s) => `<option value="${esc(s.id)}" ${s.id === scriptId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
+          </select>
+        </div>
+        ${chosenScript() ? `
+        <div class="field">
+          <label for="bvariant">选择变体</label>
+          <select id="bvariant">
+            <option value="">— 请选择 —</option>
+            ${variantsOf(chosenScript()).map((v) => `<option value="${esc(v.id)}" ${v.id === variantId ? 'selected' : ''}>变体${esc(v.id)} · ${esc((v.text || '').slice(0, 30))}${(v.text || '').length > 30 ? '…' : ''}</option>`).join('')}
+          </select>
+        </div>` : ''}` : ''}
+        <div class="field">
+          <label for="binterval">每条间隔（秒）</label>
+          <input type="number" id="binterval" value="${interval}" min="0" max="600">
+        </div>
+        <div class="field">
+          <label>本次将发送（${tasks.length} 条）</label>
+          <div style="max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:8px">
+            ${tasks.map((t) => `<div style="display:flex;gap:8px;align-items:baseline;padding:7px 10px;border-bottom:1px solid var(--line);font-size:12px">
+              <b style="min-width:74px">${esc(t.commentAuthor || '未知')}</b>
+              <span style="flex:1;min-width:0;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.commentContent || '')}</span>
+              <span style="color:var(--ink-faint);white-space:nowrap">${esc(t.videoTitle || (t.videoId ? '视频 ' + t.videoId : ''))}</span>
+            </div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    function progressHtml(okN) {
+      const pct = tasks.length ? Math.round((results.length / tasks.length) * 100) : 0;
+      return `
+        <div class="progress-bar" style="margin:6px 0 10px"><div class="progress-bar__fill" style="width:${pct}%"></div></div>
+        <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:8px">
+          已完成 <b>${results.length}</b> / ${tasks.length} · 成功 <b style="color:var(--ok)">${okN}</b> · 失败 <b style="color:var(--danger)">${results.length - okN}</b>
+          ${running ? ' · 发送中，请勿关闭浏览器…' : ''}
+        </div>
+        <div style="max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:8px">
+          ${results.map((r) => `<div style="display:flex;gap:8px;align-items:baseline;padding:7px 10px;border-bottom:1px solid var(--line);font-size:12px">
+            <span style="color:${r.ok ? 'var(--ok)' : 'var(--danger)'};white-space:nowrap">${r.ok ? '✓ 已发送' : '✗ 失败'}</span>
+            <b style="min-width:74px">${esc(r.task.commentAuthor || '未知')}</b>
+            <span style="flex:1;min-width:0;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.msg)}">${esc(r.msg)}</span>
+          </div>`).join('') || '<div style="padding:14px;text-align:center;color:var(--ink-faint);font-size:12.5px">准备中…</div>'}
+        </div>`;
+    }
+
+    function bindPick() {
+      $$('input[name="bmode"]').forEach((r) => r.addEventListener('change', () => {
+        mode = r.value;
+        if (mode === 'script' && !scriptId && commentScripts.length) {
+          scriptId = commentScripts[0].id;
+          const v0 = variantsOf(commentScripts[0])[0];
+          variantId = v0 ? v0.id : null;
+        }
+        render();
+      }));
+      const bs = $('#bscript');
+      if (bs) bs.addEventListener('change', () => {
+        scriptId = bs.value || null;
+        const v0 = variantsOf(chosenScript())[0];
+        variantId = v0 ? v0.id : null;
+        render();
+      });
+      const bv = $('#bvariant');
+      if (bv) bv.addEventListener('change', () => { variantId = bv.value || null; render(); });
+      const bi = $('#binterval');
+      if (bi) bi.addEventListener('change', () => { interval = Math.max(0, parseInt(bi.value, 10) || 0); });
+      $('#bstart')?.addEventListener('click', async () => {
+        if (mode === 'script' && !chosenVariant()) { toast('请先选择话术变体', 'warn'); return; }
+        try {
+          const st = await API.commentAgentStatus();
+          if (!st || st.ok === false || !st.cdpReady) {
+            toast('自动化浏览器未启动，请先点「启动浏览器并登录」', 'warn');
+            return;
+          }
+          if (st.loggedIn === false) { toast('浏览器已启动但抖音未登录，请先扫码登录', 'warn'); return; }
+        } catch (e) { /* 状态取不到不阻断，由发送结果兜底 */ }
+        if (!window.confirm(`确认向 ${tasks.length} 条评论真实发送回复？发送后无法撤回。`)) return;
+        await run();
+      });
+    }
+
+    async function run() {
+      running = true; finished = false; results = []; stopped = false;
+      render();
+      for (let i = 0; i < tasks.length; i++) {
+        const t = tasks[i];
+        let text = '', sId, vId;
+        try {
+          if (mode === 'script') {
+            const v = chosenVariant();
+            text = v.text; sId = chosenScript().id; vId = v.id;
+          } else {
+            const pick = await API.pickCommentScript();
+            if (!pick || pick.ok === false || !pick.text) throw new Error((pick && pick.message) || '没有可用的评论话术');
+            text = pick.text; sId = pick.scriptId; vId = pick.variantId;
+          }
+          // 单条发送 20–200s，超时放到 180s
+          const res = await API.commentExecute({
+            taskId: t.id, text, confirm: true,
+            match: t.commentContent || '',
+            scriptId: sId || undefined, variantId: vId || undefined,
+          }, 180000);
+          const ok = !!(res && res.status === 'accepted');
+          results.push({ task: t, ok, msg: ok ? '已发送' : ((res && res.message) || '未确认发送成功'), text });
+        } catch (e) {
+          results.push({ task: t, ok: false, msg: e.message || '发送异常', text });
+        }
+        render();
+        if (stopped) break;
+        if (i < tasks.length - 1 && interval > 0) await sleep(interval * 1000);
+      }
+      running = false; finished = true;
+      render();
+      const okN = results.filter((r) => r.ok).length;
+      toast(`批量回复完成：成功 ${okN} / ${results.length} 条`, okN ? 'ok' : 'warn');
+      interactSel.clear();
+    }
+
+    render();
+  }
+
   function openReplyModal(taskId, commentScripts, task = {}, matchOverride = '') {
     let selectedScript = null;
     let selectedVariant = null;
@@ -4641,6 +6213,7 @@
     let sendError = '';
     let replyContent = '';
     let replyVariant = '';      // 本次实际使用的话术/变体，用于结果展示
+    let aiGuard = null;          // 话术质检结果（候选池已移除质检，统一在评论回复这里做）
 
     async function loadAiSuggestions() {
       if (!(await aiEnsureConfigured())) return;
@@ -4683,14 +6256,17 @@
 
     // 唯一发送出口：confirm=false 只定位并填入草稿，true 真实提交到抖音
     async function runSend(payload, confirm) {
-      replyContent = payload.text;
+      // 发送前把 {变量} 按当前业务画像实时解析（P1：画像→话术 贯通）
+      const ctx = await ensureProfileCtx();
+      const resolvedText = resolveProfileVars(payload.text, ctx);
+      replyContent = resolvedText;
       replyVariant = payload.label || '';
       phase = 'working';
       workingLabel = confirm ? '正在定位评论并发送到抖音' : '正在定位目标评论';
       renderModal();
       const res = await API.commentExecute({
         taskId,
-        text: payload.text,
+        text: resolvedText,
         confirm,
         match: matchOverride || task.commentContent || '',
         scriptId: payload.scriptId || undefined,
@@ -4893,6 +6469,13 @@
       // phase === 'pick'：选内容并发送
       const tabCls = (m) => (mode === m ? 'btn--primary' : 'btn--ghost');
       const manualReady = mode === 'auto' ? true : !!currentReplyPayload();
+      const guardHtml = aiGuard ? `<div class="cg-guardresult" style="margin:10px 0;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:12px">
+        ${aiGuard.loading ? '<span class="muted">质检中…</span>'
+          : aiGuard.error ? `<span class="tag tag--failed">质检出错</span> <span class="muted">${esc(aiGuard.error)}</span>`
+          : `<span class="tag ${aiGuard.pass ? 'tag--healthy' : 'tag--failed'}">${aiGuard.pass ? '质检通过' : '未通过'}</span>
+             <span class="muted">禁止 ${fmt(aiGuard.blockCount || 0)} · 提示 ${fmt(aiGuard.warnCount || 0)}</span>
+             ${(aiGuard.hits || []).map((h) => `<div class="muted" style="margin-top:2px">${esc(h.category || '未分类')}：命中「${esc(h.matched || '')}」${h.advice ? '（' + esc(h.advice) + '）' : ''}</div>`).join('')}`}
+      </div>` : '';
 
       openModal(`
         <h2 id="modal-title">回复这条评论</h2>
@@ -4923,9 +6506,11 @@
             ${aiHtml}
           </div>
         </div>
-        <p class="reply-confirm-note">「仅预览」只打开自动化浏览器定位这条评论并填入草稿，不发送；「发送」才会真正提交到抖音。</p>
+        <p class="reply-confirm-note">「仅预览」只打开自动化浏览器定位这条评论并填入草稿，不发送；「发送」才会真正提交到抖音。发送前可先点「质检话术」检查是否触规。</p>
+        ${guardHtml}
         <div class="modal__foot">
           <button type="button" class="btn" data-close>取消</button>
+          <button type="button" class="btn btn--ghost" id="reply-guard" ${!manualReady ? 'disabled style="opacity:.5;cursor:not-allowed"' : ''}>质检话术</button>
           <button type="button" class="btn btn--ghost" id="reply-preview" ${!manualReady ? 'disabled style="opacity:.5;cursor:not-allowed"' : ''}>仅预览</button>
           <button type="button" class="btn btn--primary" id="reply-confirm" ${!manualReady ? 'disabled style="opacity:.5;cursor:not-allowed"' : ''}>${mode === 'auto' ? '按权重挑一条并发送' : '定位并发送'}</button>
         </div>`);
@@ -4971,49 +6556,562 @@
         const payload = currentReplyPayload();
         if (payload) runSend(payload, false);
       });
+      $('#reply-guard')?.addEventListener('click', async () => {
+        const payload = currentReplyPayload();
+        if (!payload || !payload.text) { toast('请先选择或生成话术再质检', 'warn'); return; }
+        aiGuard = { loading: true };
+        renderModal();
+        try {
+          aiGuard = await API.guardCheck(payload.text, task.account || undefined);
+        } catch (e) {
+          aiGuard = { error: (e && e.message) ? e.message : String(e) };
+        }
+        renderModal();
+      });
     }
 
     renderModal();
   }
 
-  function scriptCard(s) {
-    const variants = s.variants.map((v) => {
-      const statusLabel = { active: '<span class="tag tag--wechat">使用中</span>', switched_off: '<span class="tag tag--failed">已停用</span>', draft: '<span class="tag tag--low">草稿</span>' }[v.status];
-      const conv = v.convRate != null ? `${v.convRate}%` : '—';
+  /** 一条话术（含变体 + 欢迎语）实际用到了哪些画像变量 */
+  function scriptVarsOf(s) {
+    if (!s) return [];
+    const all = (s.variants || []).map((v) => v.text || '').join('\n') + '\n' + (s.welcomeMsg || '');
+    return detectUsedVars(all);
+  }
+
+  /** 话术卡（精简版）：变体压成单行、点行展开全文。
+      2026-09-13 精简：原卡片 454~613px（变体行各占 113~135px）→ 约 200px。
+      ⚠️ r2Threshold 必须由调用方传入：它是 viewScripts 的局部变量，
+      写成自由变量只在 convRate 全为 null 时不炸（短路），一旦有转化率数据就整页报错。 */
+  function scriptCard(s, r2Threshold) {
+    const r2 = r2Threshold == null ? 8 : r2Threshold;
+    const vs = s.variants || [];
+    const allText = vs.map((v) => v.text).join('\n') + '\n' + (s.welcomeMsg || '');
+    const usedVars = detectUsedVars(allText);
+    const catLabel = (SCRIPT_TABS.find((t) => t.key === s.category) || {}).label || s.category;
+    const convs = vs.map((v) => v.convRate).filter((x) => x != null);
+    const bestConv = convs.length ? Math.max.apply(null, convs) : null;
+
+    const variantsHtml = vs.length ? vs.map((v) => {
+      const meta = { active: ['使用中', 'is-on'], switched_off: ['已停用', 'is-off'], draft: ['草稿', 'is-draft'] }[v.status] || [v.status, ''];
+      const conv = v.convRate != null ? v.convRate + '%' : '—';
+      const low = v.convRate != null && v.convRate < r2;
+      const tip = `发送 ${fmt(v.sent)} / 回复 ${fmt(v.replied)}`
+        + (v.wechatAdded != null ? ` / 加微 ${fmt(v.wechatAdded)}` : '')
+        + ` · 加微转化率 ${conv}`;
       return `
-        <div class="variant-row">
-          <div style="display:flex;flex-direction:column;gap:4px;align-items:center">
-            <span style="font-family:var(--font-display);font-weight:700;font-size:16px">${v.id}</span>
-            ${statusLabel}
-          </div>
-          <div class="variant-row__body">
-            <div style="font-size:13px;line-height:1.65;color:var(--ink)">${esc(v.text)}</div>
-            <div class="script-meta" style="margin-top:6px">
-              <span>权重 <b>${v.weight}%</b></span>
-              <span>发送 <b>${fmt(v.sent)}</b></span>
-              <span>回复 <b>${fmt(v.replied)}</b></span>
-              ${v.wechatAdded != null ? `<span>加微 <b>${fmt(v.wechatAdded)}</b></span>` : ''}
-              <span>加微转化率 <b style="${v.convRate != null && v.convRate < 8 ? 'color:var(--danger)' : ''}">${conv}</b></span>
-            </div>
-            ${v.r2Note ? `<div class="r2-flag" style="margin-top:7px">⚑ R2 自动切换：${esc(v.r2Note)}</div>` : ''}
-          </div>
+        <div class="svrow">
+          <span class="svrow__id">${esc(v.id)}</span>
+          <span class="svrow__tag ${meta[1]}">${esc(meta[0])}</span>
+          <span class="svrow__text" data-raw="${esc(v.text)}" title="点击展开 / 收起全文">${esc(v.text)}</span>
+          <span class="svrow__meta">
+            <span class="svrow__w" title="权重（A/B 分配比例）">${v.weight}%</span>
+            <span class="svrow__conv${low ? ' is-low' : ''}" title="${esc(tip)}">${conv}</span>
+            ${v.r2Note ? `<span class="svrow__r2" title="${esc('变体按权重随机分配：' + v.r2Note)}">⚑</span>` : ''}
+          </span>
         </div>`;
-    }).join('');
+    }).join('') : '<div class="svrow svrow--empty">还没有变体，点「编辑」加一条。</div>';
+
+    const varTags = usedVars.length
+      ? `<span class="sc-foot__vars">绑定画像：${usedVars.map((k) => `<span class="var-chip var-chip--sm">{${esc(k)}}</span>`).join('')}</span>`
+      : '';
+    const welcome = (s.welcomeMsg || '').trim();
 
     return `
-      <div class="card script-card">
-        <div class="card__head">
-          <span class="card__title">${esc(s.name)}</span>
+      <div class="card script-card${s.active === false ? ' is-off' : ''}" data-script-id="${esc(s.id)}">
+        <div class="sc-head">
+          <span class="sc-head__name" title="${esc(s.intro || '')}">${esc(s.name)}</span>
           ${s.isMain ? '<span class="tag tag--deal">主话术</span>' : ''}
+          ${s.source === 'generated' ? '<span class="tag tag--brand">画像生成</span>' : ''}
+          ${s.source === 'imported' ? '<span class="tag tag--brand">文件导入</span>' : ''}
+          ${s.active === false ? '<span class="tag tag--failed">已停用</span>' : ''}
+          <span class="tag tag--low">${esc(catLabel)}</span>
           <span class="card__spacer"></span>
-          <span class="card__hint">${esc(s.intro)}</span>
+          <span class="sc-head__meta">${vs.length} 变体${bestConv != null ? ' · 转化 ' + bestConv + '%' : ''}</span>
+          <button type="button" class="btn btn--sm btn--ai" data-script-ai="${esc(s.id)}" title="勾选画像变量 → AI 按这些变量改写本条话术">AI 优化</button>
+          <button type="button" class="btn btn--sm" data-script-edit="${esc(s.id)}">编辑</button>
+          <button type="button" class="btn btn--sm" data-script-preview="${esc(s.id)}" title="用当前业务画像解析话术里的 {变量}">预览</button>
         </div>
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px">企微欢迎语（加微后自动发送）</div>
-          <div class="script-text" style="margin-bottom:12px">${esc(s.welcomeMsg)}</div>
-        </div>
-        <div>${variants}</div>
+        <div class="sc-vbox">${variantsHtml}</div>
+        ${(varTags || welcome) ? `<div class="sc-foot">
+          ${varTags}
+          ${welcome ? `<span class="sc-foot__welcome" title="${esc(welcome)}">企微欢迎语：${esc(welcome.length > 36 ? welcome.slice(0, 36) + '…' : welcome)}</span>` : ''}
+        </div>` : ''}
+        <div class="scr-preview" id="scr-prev-${esc(s.id)}" hidden></div>
       </div>`;
+  }
+
+  /* ═══════════════════════════════════════════
+     AI 话术优化面板（话术卡弹窗 / 编辑弹窗共用）
+
+     用户勾选要参与的画像变量 → AI 只基于这些变量改写现有变体或追加新变体。
+     输出保留 {变量} 占位符（不把画像值写死），所以画像改了话术自动跟着变。
+     只产出草稿：勾选 + 可编辑，点「应用」才写回（写回方式由 onApply 决定）。
+     ═══════════════════════════════════════════ */
+  async function mountAiOptimize(host, opts) {
+    const script = opts.script || {};
+    const ctx = opts.ctx || await ensureProfileCtx();
+    const getVariants = opts.getVariants || (() => []);
+    const onApply = opts.onApply || (() => {});
+    const used = scriptVarsOf(script);           // 本条话术已用的变量 → 默认勾上
+
+    const groupsHtml = Object.keys(VAR_SRC).map((g) => {
+      const list = SCRIPT_VARS.filter((v) => v.src === g);
+      if (!list.length) return '';
+      const chips = list.map((v) => {
+        const val = String(v.get(ctx) || '').trim();
+        const on = used.includes(v.key);
+        const short = val.length > 14 ? val.slice(0, 14) + '…' : val;
+        return `<label class="vchk${on ? ' is-on' : ''}${val ? '' : ' is-empty'}"
+            title="${esc(VAR_SRC[g].label + ' · ' + v.label + '：' + (val || '画像里还没填这一项'))}">
+          <input type="checkbox" data-v="${esc(v.key)}"${on ? ' checked' : ''}>
+          <span class="vchk__k">{${esc(v.key)}}</span>
+          <span class="vchk__v">${esc(short || '未填')}</span>
+        </label>`;
+      }).join('');
+      return `<div class="vgroup"><span class="vgroup__name">${esc(VAR_SRC[g].label)}</span><div class="vgroup__chips">${chips}</div></div>`;
+    }).join('');
+
+    host.innerHTML = `
+      <div class="aio">
+        <div class="aio__sec">
+          <div class="aio__hd">① 参与本次优化的画像变量
+            <span class="aio__hint">已选 <b id="aio-n">${used.length}</b> 个 · 标「未填」的 AI 用不上，先去画像里填</span>
+          </div>
+          <div class="aio__vars" id="aio-vars">${groupsHtml}</div>
+        </div>
+        <div class="aio__sec">
+          <div class="aio__hd">② 模式</div>
+          <div class="aio__modes">
+            <label class="aio__mode"><input type="radio" name="aio-mode" value="optimize" checked>
+              <span>优化现有变体</span><em>每条给一版新的，变体编号不变</em></label>
+            <label class="aio__mode"><input type="radio" name="aio-mode" value="new">
+              <span>追加新变体</span><em><input type="number" id="aio-count" value="2" min="1" max="3"> 条（A/B 用）</em></label>
+          </div>
+        </div>
+        <div class="aio__acts">
+          <button type="button" class="btn btn--primary btn--sm" id="aio-run">生成优化方案</button>
+          <button type="button" class="btn btn--sm" id="aio-again" hidden>换一批</button>
+          <span class="aio__tip" id="aio-tip"></span>
+        </div>
+        <div class="aio__out" id="aio-out"></div>
+      </div>`;
+
+    const out = $('#aio-out', host);
+    const tip = $('#aio-tip', host);
+    const runBtn = $('#aio-run', host);
+    const againBtn = $('#aio-again', host);
+    let lastDrafts = [];
+
+    // 勾选态：改 .vchk 的 is-on（样式）+ 更新计数
+    $$('#aio-vars .vchk', host).forEach((lb) => {
+      const cb = lb.querySelector('input[data-v]');
+      cb.addEventListener('change', () => {
+        lb.classList.toggle('is-on', cb.checked);
+        $('#aio-n', host).textContent = $$('#aio-vars input[data-v]', host).filter((x) => x.checked).length;
+      });
+    });
+
+    const selected = () => $$('#aio-vars input[data-v]', host).filter((x) => x.checked).map((x) => x.dataset.v);
+    const mode = () => (host.querySelector('input[name="aio-mode"]:checked') || {}).value || 'optimize';
+
+    const renderOut = (data) => {
+      lastDrafts = data.drafts || [];
+      const miss = data.missing || [];
+      out.innerHTML = `
+        ${miss.length ? `<div class="aio__warn">⚠️ 勾了但画像里没值：${miss.map((k) => esc('{' + k + '}')).join(' ')} — AI 已跳过，去「业务画像」补填后重生成更准。</div>` : ''}
+        <div class="aio__list">
+          ${lastDrafts.map((d, i) => `
+            <div class="aio-draft" data-i="${i}">
+              <div class="aio-draft__hd">
+                <label class="aio-draft__pick"><input type="checkbox" data-pick checked> 采用</label>
+                <span class="aio-draft__id">${esc(d.variantId)}${d.isNew ? ' · 新增' : ''}</span>
+                <span class="card__spacer"></span>
+                <button type="button" class="btn btn--sm" data-copy-draft>复制</button>
+              </div>
+              ${d.isNew ? '' : `<div class="aio-draft__old" title="原文">原文：${esc(d.old || '')}</div>`}
+              <textarea class="aio-draft__text" data-text rows="2">${esc(d.text)}</textarea>
+              <div class="aio-draft__prev" data-prev></div>
+            </div>`).join('')}
+        </div>
+        <div class="aio__foot">
+          <button type="button" class="btn btn--primary btn--sm" id="aio-apply">应用选中的 ${lastDrafts.length} 条</button>
+          <span class="aio__hint">应用到话术后仍可编辑；新变体默认「草稿 + 权重 0」，设好权重再启用。</span>
+        </div>`;
+
+      const repaintPrev = () => {
+        $$('.aio-draft', out).forEach((row) => {
+          const ta = row.querySelector('[data-text]');
+          const pv = row.querySelector('[data-prev]');
+          const draw = () => {
+            const t = ta.value.trim();
+            pv.innerHTML = t
+              ? `<span class="aio-draft__plabel">发送时解析：</span>${esc(resolveProfileVars(t, ctx)).replace(/\n/g, '<br>')}`
+              : '';
+          };
+          ta.addEventListener('input', draw);
+          draw();
+        });
+      };
+      repaintPrev();
+
+      out.querySelectorAll('[data-copy-draft]').forEach((b) => b.addEventListener('click', (e) => {
+        const row = e.currentTarget.closest('.aio-draft');
+        const t = row.querySelector('[data-text]').value;
+        navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(t).then(() => toast('已复制')) : toast('请手动复制', 'warn');
+      }));
+
+      $('#aio-apply', out).addEventListener('click', async () => {
+        const picked = [];
+        $$('.aio-draft', out).forEach((row) => {
+          if (!row.querySelector('[data-pick]').checked) return;
+          const i = parseInt(row.dataset.i, 10);
+          const d = lastDrafts[i];
+          const text = row.querySelector('[data-text]').value.trim();
+          if (d && text) picked.push({ variantId: d.variantId, text, old: d.old || '', isNew: !!d.isNew });
+        });
+        if (!picked.length) { toast('至少勾选一条要应用的', 'warn'); return; }
+        const btn = $('#aio-apply', out);
+        btn.disabled = true; btn.textContent = '应用中…';
+        try {
+          await onApply(picked);
+        } catch (err) {
+          toast('应用失败：' + err.message, 'warn');
+          btn.disabled = false; btn.textContent = '应用选中的 ' + lastDrafts.length + ' 条';
+        }
+      });
+    };
+
+    const run = async () => {
+      const vars = selected();
+      if (!vars.length) { toast('先勾选至少一个画像变量', 'warn'); return; }
+      const vs = getVariants().filter((v) => (v.text || '').trim());
+      if (!vs.length) { toast('这条话术还没有变体内容，先写一条再优化', 'warn'); return; }
+      runBtn.disabled = true; againBtn.disabled = true;
+      runBtn.textContent = 'AI 生成中…';
+      tip.textContent = '正在调用 AI（约 10~60 秒）…';
+      out.innerHTML = '';
+      try {
+        const data = await API.optimizeScript(script.id, {
+          variables: vars,
+          mode: mode(),
+          count: parseInt(($('#aio-count', host) || {}).value, 10) || 2,
+          variants: vs.map((v) => ({ variantId: v.variantId, text: v.text })),
+        });
+        renderOut(data);
+        tip.textContent = '已生成，勾选要用的并可再改。';
+        againBtn.hidden = false;
+      } catch (err) {
+        tip.textContent = '';
+        out.innerHTML = `<div class="aio__err">生成失败：${esc(friendlyAiError(err.message))}</div>`;
+      } finally {
+        runBtn.disabled = false; runBtn.textContent = '生成优化方案';
+        againBtn.disabled = false;
+      }
+    };
+
+    runBtn.addEventListener('click', run);
+    againBtn.addEventListener('click', run);
+  }
+
+  /** 把 AI 上游报错翻成人话（余额 / 未配置 / 超时） */
+  function friendlyAiError(msg) {
+    const m = String(msg || '');
+    if (/INSUFFICIENT_BALANCE|余额/i.test(m)) return 'AI 账号余额不足，去「设置 → AI 配置」换 Key 或去中转站充值。';
+    if (/没有配置|未配置|no api key|api_key/i.test(m)) return '还没配置 AI 接口，去「设置 → AI 配置」填 Key。';
+    if (/超时|timeout/i.test(m)) return 'AI 调用超时，稍后重试（可少勾几个变量加快速度）。';
+    if (/\b502\b/.test(m)) return 'AI 服务返回 502：多为第三方中转站余额不足或 Key 失效，去「设置 → AI 配置」检查。';
+    return m || '未知错误';
+  }
+
+  /** 话术卡上的「AI 优化」：独立弹窗承载上面的面板，应用后直接落库并刷新 */
+  async function openScriptAiDialog(script, onSaved) {
+    openModal(`
+      <h2 id="modal-title">AI 优化话术</h2>
+      <p class="modal__lede">「${esc(script.name || '')}」· 勾选要参与的画像变量，AI 只按这些变量改写。
+        输出保留 <code>{变量}</code> 占位符（不把画像值写死），画像改了话术自动跟着变。</p>
+      <div id="aio-host"><div class="muted">正在读取业务画像…</div></div>
+      <div class="modal__foot"><button type="button" class="btn" data-close>关闭</button></div>`, { wide: true });
+    await mountAiOptimize($('#aio-host'), {
+      script,
+      getVariants: () => (script.variants || []).map((v) => ({ variantId: v.id || v.variantId, text: v.text || '' })),
+      onApply: async (drafts) => {
+        for (const d of drafts) {
+          if (d.isNew) {
+            await API.addScriptVariant(script.id, { variantId: d.variantId, text: d.text, weight: 0, status: 'draft' });
+          } else {
+            await API.updateScriptVariant(script.id, d.variantId, { text: d.text });
+          }
+        }
+        toast('已应用 ' + drafts.length + ' 条到「' + (script.name || '') + '」', 'ok');
+        closeModal();
+        invalidateProfileCtx();
+        if (onSaved) await onSaved();
+      },
+    });
+  }
+
+  /* ═══════════════════════════════════════════
+     话术编辑弹窗（改名/分类/备注/欢迎语/启用 + 变体增删改）
+     ═══════════════════════════════════════════ */
+  const SCRIPT_CAT_OPTIONS = [
+    ['comment', '评论话术'], ['welcome', '欢迎语/首句'], ['private_message', '私信话术'],
+    ['wechat_guide', '微信引导'], ['objection', '异议处理'], ['nurture', '培育SOP'],
+  ];
+  const VARIANT_STATUS_OPTIONS = [
+    ['active', '使用中'], ['switched_off', '已停用'], ['draft', '草稿'],
+  ];
+  /** 下一个可用的变体字母（A/B/C…），已用的跳过 */
+  const nextVariantId = (used) => {
+    for (let i = 0; i < 26; i++) {
+      const c = String.fromCharCode(65 + i);
+      if (!used.includes(c)) return c;
+    }
+    return 'V' + (used.length + 1);
+  };
+
+  /** 打开话术编辑弹窗。s = 话术对象（含 variants）；onSaved = 保存/删除成功后的刷新回调
+      （刷新要用 viewScripts 里的 scripts/render，所以由调用方传进来，别在这里直接引用）。 */
+  async function openScriptEditModal(s, onSaved) {
+    const ctx = await ensureProfileCtx();
+    // head = 话术级字段；vs = 变体数组。两者都只存内存，点「保存」才落库。
+    const head = {
+      name: s.name, category: s.category, intro: s.intro || '',
+      welcomeMsg: s.welcomeMsg || '', active: s.active !== false,
+    };
+    let vs = (s.variants || []).map((v) => ({
+      variantId: v.id, text: v.text || '',
+      weight: v.weight == null ? 50 : v.weight, status: v.status || 'active',
+    }));
+
+    const catOpts = SCRIPT_CAT_OPTIONS
+      .map(([k, l]) => `<option value="${k}"${k === head.category ? ' selected' : ''}>${l}</option>`).join('');
+    const varChips = varChipsHtml(ctx);
+
+    // AI 优化区默认收起；展开后回填的草稿只改内存里的 vs，点「保存」才落库
+    let aiOpen = false;
+
+    const formHtml = () => `
+      <div class="se-info">
+        <div class="field"><label for="se-name">话术名称</label><input type="text" id="se-name" value="${esc(head.name)}" placeholder="例：装修 · 报价跟进"></div>
+        <div class="field"><label for="se-cat">话术分类</label><select id="se-cat">${catOpts}</select></div>
+        <div class="field"><label for="se-intro">备注（选填）</label><input type="text" id="se-intro" value="${esc(head.intro)}" placeholder="例：报价后 24 小时内跟进"></div>
+        <div class="field"><label for="se-welcome">企微欢迎语（加微后自动发送）</label><input type="text" id="se-welcome" value="${esc(head.welcomeMsg)}" placeholder="留空则不加微后发欢迎语"></div>
+        <label class="se-active"><input type="checkbox" id="se-active"${head.active ? ' checked' : ''}> 启用（停用后评论回复 / 私信不再取这条话术）</label>
+      </div>
+      <div class="se-vbox" id="se-vbox">
+        ${vs.map((v, i) => `
+          <div class="se-v" data-i="${i}">
+            <div class="se-v__head">
+              <span class="se-v__id">${esc(v.variantId)}</span>
+              <label class="se-v__w">权重 <input type="number" min="0" max="100" step="5" data-v-weight value="${v.weight}">%</label>
+              <select class="se-v__status" data-v-status>${VARIANT_STATUS_OPTIONS
+                .map(([k, l]) => `<option value="${k}"${k === v.status ? ' selected' : ''}>${l}</option>`).join('')}</select>
+              <span class="card__spacer"></span>
+              <button type="button" class="btn btn--sm btn--danger" data-v-del>删除变体</button>
+            </div>
+            <div class="se-v__vars">
+              <button type="button" class="se-v__vars-toggle" data-v-vars-toggle>＋ 插入变量</button>
+              <div class="var-chips" hidden>${varChips}</div>
+            </div>
+            <textarea data-v-text rows="3" placeholder="话术内容，可用 {变量} 绑定业务画像">${esc(v.text)}</textarea>
+            <div class="se-v__prev" data-v-prev></div>
+          </div>`).join('') || '<div class="se-vbox__empty">还没有变体，点下面「＋ 添加变体」。</div>'}
+      </div>
+      <div class="se-vbox__foot">
+        <button type="button" class="btn btn--sm" id="se-add-v">＋ 添加变体</button>
+        <span class="se-vbox__tip">建议至少 2 个变体做 A/B；权重按比例分配流量（合计 100% 最直观）。</span>
+      </div>
+      <div class="se-ai">
+        <button type="button" class="btn btn--sm btn--ai" id="se-ai-toggle">${aiOpen ? '－ 收起 AI 优化' : '＋ AI 优化 / 扩写'}</button>
+        <span class="se-vbox__tip">勾选要让 AI 参与的画像变量，改写结果回填到上面；点「保存」才生效。</span>
+        <div class="se-ai__body" id="se-ai-body"${aiOpen ? '' : ' hidden'}></div>
+      </div>`;
+
+    openModal(`
+      <h2 id="modal-title">编辑话术</h2>
+      <p class="modal__lede">话术只存这里。用 <code>{变量}</code> 绑定业务画像，评论回复与私信发送时自动填充最新值。</p>
+      <div id="se-wrap"></div>
+      <div class="modal__foot se-foot">
+        <button type="button" class="btn btn--danger" id="se-del-script">删除整条话术</button>
+        <span class="card__spacer"></span>
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="button" class="btn btn--primary" id="se-save">保存</button>
+      </div>`, { wide: true });
+
+    const root = $('#modal');
+
+    /** 读表单：head 字段 + 变体数组（以 DOM 为准，未保存的编辑也算数） */
+    const collect = () => {
+      const rows = $$('.se-v', root);
+      return {
+        head: {
+          name: $('#se-name', root).value.trim(),
+          category: $('#se-cat', root).value,
+          intro: $('#se-intro', root).value.trim(),
+          welcomeMsg: $('#se-welcome', root).value.trim(),
+          active: $('#se-active', root).checked,
+        },
+        variants: rows.map((el) => ({
+          variantId: el.querySelector('.se-v__id').textContent.trim(),
+          weight: parseInt(el.querySelector('[data-v-weight]').value, 10) || 0,
+          status: el.querySelector('[data-v-status]').value,
+          text: el.querySelector('[data-v-text]').value.trim(),
+        })),
+      };
+    };
+
+    /** 变体区重绘前的收尾：把当前 DOM 值收回内存 */
+    const syncFromDom = () => {
+      const cur = collect();
+      Object.assign(head, cur.head);
+      vs = cur.variants;
+    };
+
+    function wireForm() {
+      // 每个变体：实时解析预览 + 变量芯片插入 + 删除本变体
+      $$('.se-v', root).forEach((row) => {
+        const ta = row.querySelector('[data-v-text]');
+        const prev = row.querySelector('[data-v-prev]');
+        const render = () => {
+          const t = ta.value.trim();
+          prev.innerHTML = t
+            ? `<span class="se-v__prev-label">解析后：</span>${esc(resolveProfileVars(t, ctx)).replace(/\n/g, '<br>')}`
+            : '<span class="muted">输入内容后，这里显示按当前画像解析的效果</span>';
+        };
+        ta.addEventListener('input', render);
+        render();
+        // 变量芯片默认收起（21 个芯片按 4 组铺开会很长），点「＋ 插入变量」展开
+        const vTog = row.querySelector('[data-v-vars-toggle]');
+        const vBox = row.querySelector('.se-v__vars .var-chips');
+        if (vTog && vBox) vTog.addEventListener('click', () => {
+          vBox.hidden = !vBox.hidden;
+          vTog.textContent = vBox.hidden ? '＋ 插入变量' : '－ 收起变量';
+        });
+        row.querySelectorAll('.var-chip').forEach((chip) => {
+          chip.addEventListener('click', () => {
+            const tok = '{' + chip.dataset.var + '}';
+            const a = ta.selectionStart || 0, b = ta.selectionEnd || 0;
+            ta.value = ta.value.slice(0, a) + tok + ta.value.slice(b);
+            ta.selectionStart = ta.selectionEnd = a + tok.length;
+            ta.focus();
+            render();
+          });
+        });
+        row.querySelector('[data-v-del]').addEventListener('click', () => {
+          const vid = row.querySelector('.se-v__id').textContent.trim();
+          if ($$('.se-v', root).length <= 1) { toast('至少要留一个变体；不要整条话术请用「删除整条话术」', 'warn'); return; }
+          if (!window.confirm('删除变体 ' + vid + '？保存后生效。')) return;
+          syncFromDom();
+          vs = vs.filter((v) => v.variantId !== vid);
+          paint();
+        });
+      });
+      // AI 优化 / 扩写：勾选画像变量 → AI 出草稿 → 回填到上面的变体（不落库，等「保存」）
+      const aiTog = $('#se-ai-toggle', root);
+      const aiBody = $('#se-ai-body', root);
+      if (aiTog && aiBody) {
+        aiTog.addEventListener('click', () => { aiOpen = !aiOpen; paint(); });
+        if (aiOpen) {
+          mountAiOptimize(aiBody, {
+            script: { id: s.id, name: head.name, category: head.category, variants: vs },
+            getVariants: () => collect().variants.filter((v) => (v.text || '').trim()),
+            onApply: (drafts) => {
+              syncFromDom();
+              drafts.forEach((d) => {
+                if (d.isNew) {
+                  vs = vs.concat([{ variantId: d.variantId, text: d.text, weight: 0, status: 'draft' }]);
+                } else {
+                  const t = vs.find((x) => x.variantId === d.variantId);
+                  if (t) t.text = d.text;
+                }
+              });
+              paint();
+              toast('已回填 ' + drafts.length + ' 条到编辑区，点「保存」才生效', 'ok');
+            },
+          }).catch(() => {});
+        }
+      }
+      // 添加变体
+      $('#se-add-v', root).addEventListener('click', () => {
+        syncFromDom();
+        vs = vs.concat([{
+          variantId: nextVariantId(vs.map((v) => v.variantId)), text: '', weight: 0, status: 'draft',
+        }]);
+        paint();
+      });
+    }
+
+    const paint = () => {
+      const keep = root.scrollTop;
+      $('#se-wrap', root).innerHTML = formHtml();
+      wireForm();
+      // 分类下拉要跟随 head（重绘后 selected 已在模板里处理，这里只兜底）
+      const catSel = $('#se-cat', root);
+      if (catSel) catSel.value = head.category;
+      root.scrollTop = keep;
+    };
+
+    // 删除整条话术
+    $('#se-del-script', root).addEventListener('click', async () => {
+      if (!window.confirm('删除话术「' + head.name + '」及其全部变体？删除后不可恢复（历史归因记录保留）。')) return;
+      const btn = $('#se-del-script', root);
+      btn.disabled = true; btn.textContent = '删除中…';
+      try {
+        await API.deleteScript(s.id);
+        toast('已删除话术：' + head.name, 'ok');
+        closeModal();
+        invalidateProfileCtx();
+        if (onSaved) await onSaved();
+      } catch (e) {
+        toast('删除失败：' + e.message, 'warn');
+        btn.disabled = false; btn.textContent = '删除整条话术';
+      }
+    });
+
+    // 保存：话术级字段 + 变体增/删/改
+    $('#se-save', root).addEventListener('click', async () => {
+      const data = collect();
+      if (!data.head.name) { toast('请填写话术名称', 'warn'); return; }
+      const blank = data.variants.filter((v) => !v.text);
+      if (blank.length) {
+        if (!window.confirm('变体 ' + blank.map((v) => v.variantId).join('/') + ' 内容是空的，保存后它不会生效。仍要保存？')) return;
+      }
+      if (data.variants.length > 1) {
+        const total = data.variants.reduce((a, v) => a + (v.weight || 0), 0);
+        if (total !== 100 && !window.confirm('变体权重合计 ' + total + '%，不是 100%。权重只影响比例，仍可保存。继续？')) return;
+      }
+      const btn = $('#se-save', root);
+      btn.disabled = true; btn.textContent = '保存中…';
+      try {
+        await API.updateScript(s.id, {
+          name: data.head.name, category: data.head.category, intro: data.head.intro,
+          welcomeMsg: data.head.welcomeMsg, active: data.head.active,
+        });
+        const oldIds = (s.variants || []).map((v) => v.id);
+        const newIds = data.variants.map((v) => v.variantId);
+        for (const id of oldIds) {
+          if (!newIds.includes(id)) await API.deleteScriptVariant(s.id, id);
+        }
+        for (const v of data.variants) {
+          if (oldIds.includes(v.variantId)) {
+            await API.updateScriptVariant(s.id, v.variantId, { text: v.text, weight: v.weight, status: v.status });
+          } else {
+            await API.addScriptVariant(s.id, { variantId: v.variantId, text: v.text, weight: v.weight, status: v.status });
+          }
+        }
+        toast('已保存：' + data.head.name, 'ok');
+        closeModal();
+        invalidateProfileCtx();
+        if (onSaved) await onSaved();
+      } catch (e) {
+        toast('保存失败：' + e.message, 'warn');
+        btn.disabled = false; btn.textContent = '保存';
+      }
+    });
+
+    paint();
   }
 
   /* ═══════════════════════════════════════════
@@ -5104,6 +7202,9 @@
     const danger = hp < 30 || a.limitStatus === 'banned';
     const abnormal = ['safe_mode', 'banned', 'throttled40', 'paused_24h'].includes(a.limitStatus)
       || Object.values(a.factors || {}).some((v) => v !== 'good');
+    // v008：多账号登录态隔离 —— 当前正在使用哪个账号
+    const act = window.__activeAccount || {};
+    const isActive = act.accountId && act.accountId === a.id;
     return `
       <div class="acc-row${danger ? ' acc-row--danger' : ''}" data-acc="${esc(a.id)}">
         <div class="acc-row__id">
@@ -5122,6 +7223,9 @@
         <div class="acc-row__tags">
           <span class="tag tag--${tagCls}">${esc(statusLabel)}</span>
           <span class="tag tag--${schedTagCls}">调度：${esc(schedLabel)}</span>
+          ${isActive
+            ? `<span class="tag tag--ok">使用中</span><span class="tag tag--${act.loggedIn ? 'ok' : 'warn'}">${act.loggedIn ? '已登录' : '未登录'}</span>`
+            : '<button type="button" class="btn btn--sm acc-row__detail" data-acc-switch>切换账号</button>'}
           ${abnormal ? '<button type="button" class="btn btn--sm acc-row__detail" data-acc-safe>详情</button>' : ''}
         </div>
       </div>`;
@@ -5153,12 +7257,14 @@
     }
 
     main.innerHTML = '<div class="view"><div class="empty"><p>加载中…</p></div></div>';
-    const [accs, schedAccs, schedStats, schedConfig] = await Promise.all([
+    const [accs, schedAccs, schedStats, schedConfig, activeAcc] = await Promise.all([
       API.getAccounts(),
       API.fetchSchedulerAccounts().catch(() => []),
       API.fetchSchedulerStats().catch(() => ({ totalSent: 0, successRate: 0, activeAccounts: 0, perAccount: [] })),
       API.fetchSchedulerConfig().catch(() => ({ strategy: 'round_robin', healthThresholdWarn: 60, healthThresholdCritical: 30, maxConcurrent: 3 })),
+      API.getActiveAccount().catch(() => ({})),
     ]);
+    window.__activeAccount = activeAcc || {};
     const schedMap = {};
     (schedAccs || []).forEach((s) => { schedMap[s.accountId] = s; });
     const merged = (accs || []).map((a) => ({ ...a, sched: schedMap[a.id] || null }));
@@ -5195,6 +7301,23 @@
 
     $('#btn-add-acc').addEventListener('click', openAccBindModal);
     $('#btn-acc-rules').addEventListener('click', () => openAccRulesDrawer(schedConfig, merged));
+
+    // v008：切换当前使用的抖音账号（之后采集 / 评论都用该账号那份登录态）
+    $$('[data-acc-switch]', main).forEach((b) => b.addEventListener('click', async () => {
+      const id = b.closest('[data-acc]')?.dataset.acc;
+      if (!id) return;
+      b.disabled = true;
+      try {
+        const r = await API.activateAccount(id);
+        if (r && r.inherited) toast(`已切换到「${r.nickname}」，已继承当前登录态，无需重新扫码`);
+        else if (r && r.loggedIn) toast(`已切换到「${r.nickname}」，该账号已登录`);
+        else toast(`已切换到「${(r && r.nickname) || ''}」，该账号还需扫码登录一次`, 'warn');
+        await viewAccounts(params);
+      } catch (e) {
+        toast('切换失败：' + e.message, 'warn');
+        b.disabled = false;
+      }
+    }));
 
     // 安全模式详情（读真实账号数据）
     $$('[data-acc-safe]', main).forEach((b) => b.addEventListener('click', () => {
@@ -5339,8 +7462,8 @@
 
 
   /* ═══════════════════════════════════════════
-     视图：业务配置（5 步 · AI 的业务上下文）
-     原「上手向导」的业务配置部分，入口在「系统设置 → 业务配置」。
+     视图：业务画像（5 步 · AI 的业务上下文）
+     原「上手向导」的业务配置部分，入口在「话术与业务配置 → 业务画像」。
      与后端一一对应：
        1 业务画像    GET/PUT /api/business/profile
        2 产品知识库  GET/PUT /api/workbench/product
@@ -5353,89 +7476,132 @@
     { key: 'business', label: '业务画像' },
     { key: 'product', label: '产品知识库' },
     { key: 'audience', label: '目标客户' },
-    { key: 'scripts', label: '话术策略' },
     { key: 'wechat', label: '微信转化' },
   ];
 
   const BIZ_STEP_META = {
-    business: {
-      desc: '把「你是谁、卖什么、卖给谁」说清楚，系统才知道哪条评论值得跟。',
-      note: '保存后，主营产品与行业会自动带入「产品知识库」和「目标客户」，下一步会看到预填内容。',
-    },
-    product: { desc: '把产品和卖点整理成结构化知识，AI 生成话术时会引用这里的内容。' },
-    audience: { desc: '定义要抓的客户：谁、在哪、要什么、怕什么。意向关键词用于评论筛选。' },
-    scripts: { desc: '四类场景的基准话术。留空也行，后续可在话术库里补充和做 A/B 测试。' },
+    business: { desc: '我是谁 · 全局业务上下文。行业、区域只在这里维护，产品与客户信息在各自模块。' },
+    product: { desc: '卖什么 · 产品与价格只在这里维护，AI 生成话术时引用这里的内容。' },
+    audience: { desc: '卖给谁 · 客户群、需求痛点与筛选关键词只在这里维护。' },
     wechat: { desc: '转化落点：加哪个微信、什么时候引导、用什么理由。' },
   };
 
+  /* ══════════ 业务画像选项库（BIZ_OPTIONS）══════════
+     一份清单全站复用：「业务画像 / 产品知识库 / 目标客户 / 微信转化 / 话术变量」引用同一份，
+     同一概念全站只有一种写法（不会再出现「装修/家装/室内装修」三种写法）。
+     所有字段都保留「自定义输入」，这里只是常用集合，不是白名单校验。 */
+  const BIZ_OPTIONS = {
+    industry: [
+      '装修/家装', '建材/家居', '搬家/保洁', '家电/家居维修', '餐饮/小吃', '宠物服务', '婚庆/摄影', '旅游/民宿',
+      '美容/美发/美甲', '医美/整形', '健身/瑜伽', '口腔/牙科', '健康体检/中医', '月子/母婴',
+      '房产/中介', '法律咨询', '财税代账', '保险/金融', '教育培训', '汽车销售', '汽车服务/维修',
+      '软件/小程序/代运营', '批发/零售', '其他',
+    ],
+    // 主营产品：随「所属行业」联动；行业未匹配时用通用兜底
+    productGeneric: ['服务套餐', '单品/整机', '会员/年卡', '课程/培训', '咨询/方案', '定制服务'],
+    productByIndustry: {
+      '装修/家装': ['半包套餐', '全包套餐', '整装套餐', '局部翻新', '旧房改造', '软装设计', '免费量房出方案', '其他'],
+      '建材/家居': ['全屋定制', '橱柜/衣柜', '门窗', '瓷砖/地板', '卫浴', '灯具', '家具', '其他'],
+      '搬家/保洁': ['居民搬家', '公司搬迁', '日常保洁', '深度保洁', '开荒保洁', '家电清洗', '其他'],
+      '家电/家居维修': ['空调维修/清洗', '水电维修', '管道疏通', '门窗维修', '家电安装', '其他'],
+      '餐饮/小吃': ['堂食/正餐', '小吃/快餐', '火锅/烧烤', '烘焙/甜品', '奶茶/饮品', '团餐/配送', '其他'],
+      '宠物服务': ['宠物寄养', '宠物美容', '宠物医院', '宠物训练', '宠物用品', '上门喂养', '其他'],
+      '婚庆/摄影': ['婚礼策划', '婚纱摄影', '写真/亲子照', '商拍/形象照', '跟妆/礼服', '其他'],
+      '旅游/民宿': ['民宿/客栈', '跟团游', '定制游', '门票/包车', '亲子研学', '其他'],
+      '美容/美发/美甲': ['皮肤管理', '美甲美睫', '发型设计', '纹绣', '身体护理', '其他'],
+      '医美/整形': ['轻医美', '皮肤光电', '整形手术', '注射填充', '术后修复', '其他'],
+      '健身/瑜伽': ['私教课', '团课/小班', '会员年卡', '瑜伽/普拉提', '体测/康复', '其他'],
+      '口腔/牙科': ['洗牙/检查', '正畸', '种植牙', '补牙/修复', '儿童齿科', '其他'],
+      '健康体检/中医': ['体检套餐', '中医调理', '推拿/理疗', '慢病管理', '其他'],
+      '月子/母婴': ['月嫂/月护', '月子中心', '产后修复', '育儿嫂', '母婴用品', '其他'],
+      '房产/中介': ['二手房买卖', '新房代理', '租房中介', '商铺/写字楼', '过户代办', '其他'],
+      '法律咨询': ['合同纠纷', '婚姻家事', '劳动争议', '债务催收', '企业法务', '其他'],
+      '财税代账': ['代理记账', '税务筹划', '工商注册', '资质代办', '审计/汇算', '其他'],
+      '保险/金融': ['寿险', '车险', '健康险', '贷款咨询', '理财规划', '其他'],
+      '教育培训': ['学科辅导', '艺术培训', '职业技能', '雅思/留学', '成人学历', '其他'],
+      '汽车销售': ['新车销售', '二手车', '新能源车', '以租代购', '其他'],
+      '汽车服务/维修': ['保养/维修', '洗车美容', '贴膜/改装', '钣金喷漆', '年审/救援', '其他'],
+      '软件/小程序/代运营': ['小程序开发', 'APP 开发', '网站/商城', '短视频代运营', '直播代播', 'AI 工具', '其他'],
+      '批发/零售': ['批发供货', '门店零售', '电商店铺', '社群团购', '其他'],
+    },
+    // 服务区域：多选
+    area: ['同城（本市）', '本市主城区', '本市全境', '周边区县', '跨市/邻省', '全国（可线上交付）'],
+    target: ['个人消费者', '家庭用户', '年轻白领', '宝妈/家庭主妇', '业主/房东', '企业/公司采购', '个体商户/门店', '政府/事业单位', '学生', '老年人群'],
+    // 价格档位（重心下移版：低档加密、砍掉百万档）
+    price: ['面议/按方案报价', '500 元以内', '500–2000 元', '2000–5000 元', '5000–1 万', '1–3 万', '3–5 万', '5–10 万', '10–30 万', '30 万以上', '按月/年订阅'],
+    goal: ['加微信/企业微信', '留手机号', '私信回复', '到店/上门', '直接下单', '预约体验', '关注账号', '进群', '领取资料'],
+    tone: ['专业严谨', '真诚亲切', '热情有活力', '干脆利落', '耐心细致', '幽默轻松', '高端克制', '接地气/本地化'],
+    groupName: ['主城毛坯房业主', '旧房改造客户', '同城有需求客户'],
+    sellingPoints: ['免费上门量房/评估', '价格透明不增项', '自有团队不转包', '材料品牌可选', '多年质保', '先看案例再决定', '不满意可返工', '一对一专属顾问', '同城当天响应', '签订正规合同'],
+    forbidden: ['保证零增项', '全市/全网最低价', '绝对/100% 保证', '包治/根治', '官方指定/唯一授权', '永久免费', '当天见效', '无任何风险'],
+    needs: ['想了解报价', '想对比方案', '想先看案例', '想确认工期', '想了解材料/用料', '想确认售后保障', '想上门量房/看现场', '想省钱/找优惠', '想了解资质'],
+    pain: ['怕增项加价', '怕工期拖延', '怕偷工减料', '怕材料以次充好', '怕售后没人管', '不懂行怕被坑', '预算不够', '选择困难', '担心效果不符', '怕交定金有风险'],
+    intentKw: ['多少钱', '报价', '怎么收费', '贵不贵', '有优惠吗', '怎么联系', '能上门吗', '地址在哪', '想了解一下', '加个微信', '什么时候能看'],
+    excludedKw: ['招聘', '求职', '兼职', '实习', '学徒', '加盟', '代理', '批发', '同行', '免费'],
+    timing: ['评论区互动 1 次后', '私信咨询回复后', '发送报价后', '发送案例后', '用户主动问价时', '连续互动 2 次以上', '留资后 24 小时内'],
+    guideReason: ['发详细报价单', '发同小区/同类案例', '领避坑清单或资料包', '免费上门量尺/评估', '专属顾问 1 对 1', '进客户交流群', '领专属优惠'],
+    compliance: ['不主动索要手机号', '不承诺保价/最低价', '不做绝对化承诺', '不诱导私下交易', '不群发骚扰', '不冒充官方账号'],
+  };
+
+  /* 字段控件类型：
+     · sel: <选项库 key>  → 单选下拉（可自定义）
+     · tags: <选项库 key> → 多选标签（可自定义），tagSep 沿用该字段原有的存储分隔符，
+                            以免破坏下游解析（关键词按逗号切、卖点/痛点按行切）
+     · multi: true         → 多行纯文本
+     都不带 → 单行纯文本 */
+  /* use 取值（P0-2 判定，废弃旧 always/more）：
+       ai     —— 字段进 AI 提示词（script_gen._context 用到的）
+       var    —— 只作话术 {变量} 被引用（手写话术用）
+       filter —— 采集打分 / 过滤用（意向关键词、排除关键词）
+       none   —— 谁都不用（如合规备注）
+     首屏必填 6 项：所属行业 / 产品名称 / 价格区间 / 目标客户 / 核心卖点 / 主要痛点。 */
   const BIZ_FIELDS = {
     business: [
-      { k: 'industry', label: '所属行业', ph: '例：装修 / 家装' },
-      { k: 'product', label: '主营产品或服务', ph: '例：半包装修、全屋定制' },
-      { k: 'serviceArea', label: '服务区域', ph: '例：重庆主城九区' },
-      { k: 'targetCustomer', label: '目标客户', ph: '例：毛坯房业主、旧房翻新业主' },
-      { k: 'priceRange', label: '价格区间', ph: '例：5-15 万' },
-      { k: 'conversionGoal', label: '转化目标', ph: '例：添加微信' },
-      { k: 'tone', label: '沟通语气', ph: '例：专业、真诚' },
+      { k: 'industry', label: '所属行业', ph: '选择或输入行业', sel: 'industry', use: 'ai', req: true },
+      { k: 'serviceArea', label: '服务区域', ph: '点此选择区域', tags: 'area', tagSep: '、', use: 'ai', req: false },
+      { k: 'targetCustomer', label: '目标客户', ph: '选择或输入客户类型', sel: 'target', use: 'ai', req: true },
+      { k: 'conversionGoal', label: '转化目标', ph: '选择或输入目标', sel: 'goal', use: 'ai', req: false },
+      { k: 'tone', label: '沟通语气（最多 2 个）', ph: '点此选择语气', tags: 'tone', tagSep: '、', max: 2, use: 'ai', req: false },
+      { k: 'selfIntro', label: '人设 / 自我介绍', ph: '一句话说清你是谁、什么风格', hint: 'AI 用它定开场白的口吻', multi: true, use: 'ai', req: false },
     ],
     product: [
-      { k: 'productName', label: '产品名称', ph: '例：轻奢半包套餐' },
-      { k: 'description', label: '产品简介', ph: '一句话说清这个产品是什么、解决什么问题', multi: true },
-      { k: 'sellingPoints', label: '核心卖点', ph: '一行一条。例：自有施工队不转包；主材可选品牌库', multi: true },
-      { k: 'targetCustomers', label: '适用客户', ph: '例：毛坯房业主' },
-      { k: 'priceRange', label: '价格区间', ph: '例：5-15 万' },
-      { k: 'faq', label: '常见问题 FAQ', ph: '一行一条。例：包设计吗？含基础设计，效果图另计', multi: true },
-      { k: 'forbiddenClaims', label: '禁止承诺（不可说的话）', ph: '一行一条。例：保证零增项；绝对行业最低价', multi: true },
+      { k: 'productName', label: '产品名称', ph: '选择或输入产品', sel: 'product', use: 'ai', req: true },
+      { k: 'description', label: '产品简介', ph: '一句话说清这个产品是什么、解决什么问题', multi: true, use: 'ai', req: false },
+      { k: 'sellingPoints', label: '核心卖点', ph: '点此选择卖点', tags: 'sellingPoints', tagSep: '\n', use: 'ai', req: true },
+      { k: 'priceRange', label: '价格区间', ph: '选择或输入价格档', sel: 'price', use: 'ai', req: true },
+      { k: 'faq', label: '常见问题 FAQ', ph: '例：包设计吗？含基础设计，效果图另计', hint: '一行一条，问句在前', multi: true, use: 'var', req: false },
+      { k: 'forbiddenClaims', label: '禁止承诺（不可说的话）', ph: '点此选择禁语', tags: 'forbidden', tagSep: '\n', use: 'ai', req: false },
+      { k: 'serviceProcess', label: '服务流程', ph: '从接触到交付的关键步骤', hint: '一行一步，回车换行', multi: true, use: 'ai', req: false },
+      { k: 'caseStudies', label: '成功案例', ph: '有代表性的成交案例', hint: '一行一个，写清「客户类型 + 结果」', multi: true, use: 'ai', req: false },
     ],
     audience: [
-      { k: 'name', label: '客户群名称', ph: '例：主城毛坯房业主' },
-      { k: 'industry', label: '所在行业', ph: '例：装修' },
-      { k: 'region', label: '所在地区', ph: '例：重庆' },
-      { k: 'needs', label: '核心需求', ph: '一行一条。例：想了解报价；想对比方案', multi: true },
-      { k: 'painPoints', label: '主要痛点', ph: '一行一条。例：怕增项加价；怕工期拖延', multi: true },
-      { k: 'intentKeywords', label: '意向关键词', ph: '逗号分隔。例：多少钱, 报价, 半包, 怎么收费' },
-      { k: 'excludedKeywords', label: '排除关键词', ph: '逗号分隔。例：招聘, 加盟, 同行' },
-    ],
-    scripts: [
-      { k: 'commentScript', label: '评论区首次触达话术', ph: '在评论区公开回复时使用', multi: true },
-      { k: 'privateMessageScript', label: '私信话术', ph: '私信第一句', multi: true },
-      { k: 'wechatScript', label: '加微引导话术', ph: '引导加微信时使用', multi: true },
-      { k: 'objectionScript', label: '异议应对话术', ph: '客户说「太贵了 / 再考虑」时', multi: true },
+      { k: 'name', label: '客户群名称', ph: '选择或输入名称', sel: 'groupName', use: 'ai', req: false },
+      { k: 'industry', label: '所属行业', ph: '选择或输入行业', sel: 'industry', use: 'var', req: false },
+      { k: 'region', label: '所在区域', ph: '选择或输入区域', sel: 'area', use: 'var', req: false },
+      { k: 'needs', label: '核心需求', ph: '点此选择需求', tags: 'needs', tagSep: '\n', use: 'ai', req: false },
+      { k: 'painPoints', label: '主要痛点', ph: '点此选择痛点', tags: 'pain', tagSep: '\n', use: 'ai', req: true },
+      { k: 'intentKeywords', label: '意向关键词', ph: '点此选择关键词', hint: '评论命中就加分、优先推给你', tags: 'intentKw', tagSep: ',', use: 'filter', req: false },
+      { k: 'excludedKeywords', label: '排除关键词', ph: '点此选择排除词', hint: '评论命中就整条丢掉', tags: 'excludedKw', tagSep: ',', use: 'filter', req: false },
+      { k: 'excludedCustomers', label: '不接的客户', ph: '明确不服务的客户类型', hint: '一行一类，避免无效跟进', multi: true, use: 'ai', req: false },
     ],
     wechat: [
-      { k: 'wechatId', label: '微信号 / 企业微信', ph: '例：nanxi2026' },
-      { k: 'guideTiming', label: '引导加微的时机', ph: '例：客户明确表达兴趣后' },
-      { k: 'guideReason', label: '引导理由', ph: '例：发送详细方案和案例' },
-      { k: 'complianceNote', label: '合规备注', ph: '内部备注。例：不主动索要手机号、不承诺保价', multi: true },
+      { k: 'wechatId', label: '微信号 / 企业微信', ph: '例：nanxi2026', hint: '会作为 {微信号} 插进话术', use: 'var', req: false },
+      { k: 'guideTiming', label: '引导加微的时机', ph: '选择或输入时机', sel: 'timing', use: 'ai', req: false },
+      { k: 'guideReason', label: '引导理由', ph: '点此选择理由', tags: 'guideReason', tagSep: '、', use: 'ai', req: false },
+      { k: 'offerHook', label: '优惠 / 钩子', ph: '引流时的让利或诱饵', hint: '一行一个', multi: true, use: 'ai', req: false },
+      { k: 'complianceNote', label: '合规备注', ph: '点此选择合规要点', tags: 'compliance', tagSep: '\n', use: 'none', req: false },
     ],
   };
 
-  const BIZ_LOADERS = {
-    business: () => API.getBusinessProfile(),
-    product: () => API.getProductKnowledge(),
-    audience: () => API.getAudienceProfile(),
-    scripts: () => API.getScriptStrategy(),
-    wechat: () => API.getWeChatSettings(),
-  };
-  const BIZ_SAVERS = {
-    business: (d) => API.saveBusinessProfile(d),
-    product: (d) => API.saveProductKnowledge(d),
-    audience: (d) => API.saveAudienceProfile(d),
-    scripts: (d) => API.saveScriptStrategy(d),
-    wechat: (d) => API.saveWeChatSettings(d),
-  };
+  /* 4 张画像卡片已改为「记录集」接口（API.listProfileRecords / createProfileRecord /
+     updateProfileRecord / deleteProfileRecord / setPrimaryProfileRecord），
+     旧的单条 GET/PUT 仍由后端保留，供 onboarding 与 AI 生成使用。 */
 
   function bizConfigSkeletonHtml() {
     return `
         <div class="wizard">
           <div class="wizard__status" id="biz-status"></div>
-          <div class="wizard__steps" id="biz-steps">
-            ${BIZ_STEPS.map((s, i) => `
-              <div class="wizard__step" data-step="${i}">
-                <span class="wizard__step-no">${i + 1}</span><span>${esc(s.label)}</span>
-              </div>`).join('')}
-          </div>
-          <div class="card" style="padding:22px 26px">
+          <div style="padding:2px 0">
             <div id="biz-panel"></div>
           </div>
         </div>`;
@@ -5444,9 +7610,7 @@
   async function renderBizConfigBody() {
     const panel = $('#biz-panel');
     if (!panel) return;
-    const wiz = { step: 0, data: {}, snapshot: {}, status: null, busy: false };
-    let poll = null;
-    if (poll) { clearInterval(poll); poll = null; }
+    const wiz = { data: {}, cards: {}, status: null, busy: false };
 
     function renderStatus() {
       const el = $('#biz-status');
@@ -5455,9 +7619,9 @@
       if (!s) { el.style.display = 'none'; return; }
       el.style.display = '';
       const map = {
-        pending: { cls: '', txt: '尚未开始', desc: '填完任意一步即自动保存，可随时中断再来' },
-        in_progress: { cls: 'is-warn', txt: '进行中', desc: '已完成 ' + s.doneCount + '/' + s.total + ' 步' },
-        completed: { cls: 'is-ok', txt: '已完成', desc: '5 步全部填写完成，配置已生效' },
+        pending: { cls: '', txt: '尚未开始', desc: '在下方任一卡片填写并保存即可，可随时中断再来' },
+        in_progress: { cls: 'is-warn', txt: '进行中', desc: '已完成 ' + s.doneCount + '/' + s.total + ' 项' },
+        completed: { cls: 'is-ok', txt: '已完成', desc: s.total + ' 步全部填写完成，配置已生效' },
         skipped: { cls: 'is-muted', txt: '已跳过', desc: '向导已跳过，仍可随时回来补填' },
       };
       const m = map[s.status] || map.pending;
@@ -5474,178 +7638,707 @@
       renderStatus();
     }
 
-    function paintSteps() {
-      $$('#biz-steps .wizard__step').forEach((el) => {
-        const i = +el.dataset.step;
-        const doneByStatus = wiz.status && wiz.status.steps && wiz.status.steps[BIZ_STEPS[i].key];
-        el.className = 'wizard__step'
-          + (i < wiz.step ? ' wizard__step--done' : '')
-          + (i === wiz.step ? ' wizard__step--active' : '');
-        el.querySelector('.wizard__step-no').textContent =
-          (i < wiz.step || (doneByStatus && i !== wiz.step)) ? '✓' : i + 1;
+
+
+    /* ══════════ 字段控件：纯文本 / 单选下拉 / 多选标签 ══════════
+       下拉是自研的（不用原生 select / datalist），这样业务画像、话术变量、全站观感统一，
+       且「选项 + 自定义输入」两种入口都在同一个面板里。 */
+    const sepFromCode = (c) => (c === 'nl' ? '\n' : (c === 'comma' ? ',' : '、'));
+    /** 按字段固有分隔符拆成标签数组（关键词按逗号、卖点/痛点按行、区域/语气按顿号） */
+    function splitBySep(v, sep) {
+      const s = String(v == null ? '' : v);
+      const parts = sep === '\n' ? s.split('\n') : (sep === ',' ? s.split(/[,，]/) : s.split(/[、,，\n]/));
+      return parts.map((x) => x.trim()).filter(Boolean);
+    }
+    /** 取某个选项库 key 的选项；`product` 特殊：随「所属行业」联动，未匹配则通用兜底 */
+    function resolveOpts(optKey, cardKey, ctxData) {
+      if (!optKey) return [];
+      if (optKey === 'product') {
+        // 正在编辑「业务画像」时用表单里当下的行业，否则用已保存的行业
+        const src = cardKey === 'business' ? (ctxData || {}) : ((stOf('business').data) || {});
+        const ind = String(src.industry || '').trim();
+        return BIZ_OPTIONS.productByIndustry[ind] || BIZ_OPTIONS.productGeneric;
+      }
+      return BIZ_OPTIONS[optKey] || [];
+    }
+    /** 关闭所有展开的下拉（下拉面板挂在字段内，绝对定位覆盖，不撑高容器）。
+        注意：表单现在在弹窗（#modal）里，不在 #biz-panel 内，所以按全文档找。 */
+    function closeAllDrops(except) {
+      $$('.bdrop.is-open').forEach((d) => {
+        if (d === except) return;
+        d.classList.remove('is-open');
+        const t = d.querySelector('[data-drop-toggle]');
+        if (t) t.setAttribute('aria-expanded', 'false');
       });
     }
-
-    function fieldHtml(f, val) {
-      const v = val == null ? '' : String(val);
-      const common = `id="bz-${f.k}" data-field="${f.k}" placeholder="${esc(f.ph || '')}"`;
-      return `
-        <div class="field">
-          <label for="bz-${f.k}">${esc(f.label)}</label>
-          ${f.multi
-            ? `<textarea ${common} rows="3">${esc(v)}</textarea>`
-            : `<input type="text" ${common} value="${esc(v)}">`}
-        </div>`;
-    }
-    function stepHtml(i) {
-      const step = BIZ_STEPS[i];
-      const fields = BIZ_FIELDS[step.key] || [];
-      const data = wiz.data[step.key] || {};
-      const meta = BIZ_STEP_META[step.key] || {};
-      return `
-        <h2 style="font-family:var(--font-display);font-size:17px;margin-bottom:6px">第 ${i + 1} 步 · ${esc(step.label)}</h2>
-        <p style="font-size:12.5px;color:var(--ink-faint);margin-bottom:18px">${meta.desc || ''}</p>
-        ${meta.note ? `<div class="confirm-note" style="margin-bottom:16px">${meta.note}</div>` : ''}
-        <div class="grid grid--2">${fields.map((f) => fieldHtml(f, data[f.k])).join('')}</div>`;
-    }
-    function collect(i) {
-      const key = BIZ_STEPS[i].key;
-      const data = wiz.data[key] || (wiz.data[key] = {});
-      $$('#biz-panel [data-field]').forEach((el) => { data[el.dataset.field] = el.value.trim(); });
+    /** 读卡片表单当前值（以 DOM 为准：刚选下、还没保存的值也算数） */
+    function collectCard(card) {
+      const data = {};
+      card.querySelectorAll('[data-field]').forEach((el) => { data[el.dataset.field] = String(el.value == null ? '' : el.value).trim(); });
       return data;
     }
 
-    async function saveStep(i) {
-      const key = BIZ_STEPS[i].key;
-      const data = collect(i);
-      const cur = JSON.stringify(data);
-      if (wiz.snapshot[key] === cur) return { skipped: true };
-      await BIZ_SAVERS[key](data);
-      wiz.snapshot[key] = cur;
-      if (key === 'business') {
-        delete wiz.data.product; delete wiz.snapshot.product;
-        delete wiz.data.audience; delete wiz.snapshot.audience;
+    /* 用途徽章：use 取值 → 显示文案 + title（人话解释） */
+    const FIELD_USE = {
+      ai:     { label: '影响AI', title: '填了会决定 AI 写出来什么样' },
+      var:    { label: '话术变量', title: '只在手写话术的 {变量} 里被引用，AI 不读它' },
+      filter: { label: '采集过滤', title: '采集评论时给线索打分、过滤无效线索' },
+      none:   { label: '暂未使用', title: '目前没有任何地方用到，可放心留空' },
+    };
+    function fieldLabelHtml(f, uid) {
+      const u = FIELD_USE[f.use] || FIELD_USE.ai;
+      const reqBadge = f.req ? ' <span class="fld-req" title="必填">*</span>' : '';
+      const useBadge = ` <span class="fld-use is-${esc(f.use)}" title="${esc(u.title)}">${esc(u.label)}</span>`;
+      return `<label for="${uid}">${reqBadge}${esc(f.label)}${useBadge}</label>`;
+    }
+    /** 输入框按内容分级给尺寸（CSS 里定：单行 40px、多行 88px 起、选择框随内容长高），
+        不再把所有框一刀切拉成同一个高度 —— 单行框撑成 60px 显得空，多行框又不够写。 */
+    function fieldHtml(f, val, cardKey, ctxData) {
+      const v = val == null ? '' : String(val);
+      // id 带卡片前缀：industry 在「业务画像」和「目标客户」里都有，不带前缀会撞 id、label 指错框
+      const uid = `bz-${cardKey || ''}-${f.k}`;
+      const ph = f.ph || '';
+      const hint = f.hint ? `<span class="field__hint">${esc(f.hint)}</span>` : '';
+
+      // ① 纯文本（单行 / 多行）
+      if (!f.sel && !f.tags) {
+        const common = `id="${uid}" data-field="${f.k}" placeholder="${esc(ph)}"`;
+        return `
+        <div class="field${f.multi ? ' field--multi' : ''}">
+          ${fieldLabelHtml(f, uid)}
+          ${f.multi
+            ? `<textarea ${common} rows="3">${esc(v)}</textarea>`
+            : `<input type="text" ${common} value="${esc(v)}">`}
+          ${hint}
+        </div>`;
       }
-      return { skipped: false };
+
+      // ② 多选标签：已选的显示为胶囊（可 × 移除），面板里点选项即添加、也能输入自定义
+      if (f.tags) {
+        const sep = f.tagSep === '\n' ? '\n' : (f.tagSep === ',' ? ',' : '、');
+        const code = sep === '\n' ? 'nl' : (sep === ',' ? 'comma' : 'dot');
+        const cur = splitBySep(v, sep);
+        const rest = resolveOpts(f.tags, cardKey, ctxData).filter((o) => !cur.includes(o));
+        return `
+        <div class="field field--tags" data-tags="${f.k}" data-opt="${f.tags}" data-tagsep="${code}" data-ph="${esc(ph)}"${f.max ? ` data-max="${f.max}"` : ''}>
+          ${fieldLabelHtml(f, uid)}
+          <div class="bdrop" data-drop>
+            <div class="bdrop__box" data-drop-toggle tabindex="0"
+                 aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(f.label)}">
+              <div class="bdrop__tags" data-tagbox>${cur.length
+                ? cur.map((t) => `<span class="bchip">${esc(t)}<button type="button" class="bchip__x" data-tag-del="${esc(t)}" title="移除">×</button></span>`).join('')
+                : `<span class="bdrop__ph">${esc(ph || '点此选择')}</span>`}</div>
+              <span class="bdrop__pick" data-drop-open aria-hidden="true">＋ 选择</span>
+              <span class="bdrop__caret" aria-hidden="true"></span>
+            </div>
+            <div class="bdrop__panel">
+              <input type="text" class="bdrop__input" data-drop-input placeholder="输入自定义值，回车添加" aria-label="${esc(f.label)}：搜索或输入自定义值">
+              <div class="bdrop__list" role="listbox">${rest.length
+                ? rest.map((o) => `<button type="button" class="bdrop__opt" data-tag-add="${esc(o)}" role="option" aria-selected="false">${esc(o)}</button>`).join('')
+                : ''}<span class="bdrop__none" hidden></span></div>
+              <div class="bdrop__foot">
+                <span class="bdrop__tip">${f.max ? `最多选 ${f.max} 项` : '可多选'}</span>
+                <button type="button" class="btn btn--sm" data-tag-clear>清空</button>
+                <button type="button" class="btn btn--sm btn--primary" data-drop-done>完成</button>
+              </div>
+            </div>
+          </div>
+          <input type="hidden" id="${uid}" data-field="${f.k}" value="${esc(v)}">
+          ${hint}
+        </div>`;
+      }
+
+      // ③ 单选下拉：点选项即选中并收起；也能输入自定义值回车确定
+      const opts = resolveOpts(f.sel, cardKey, ctxData);
+      const list = (v && !opts.includes(v)) ? [v].concat(opts) : opts;
+      return `
+        <div class="field" data-sel="${f.k}" data-opt="${f.sel}" data-ph="${esc(ph)}">
+          ${fieldLabelHtml(f, uid)}
+          <div class="bdrop" data-drop>
+            <div class="bdrop__box" data-drop-toggle tabindex="0"
+                 aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(f.label)}">
+              <span class="bdrop__val${v ? '' : ' is-empty'}" data-val>${esc(v || ph || '请选择或输入')}</span>
+              <span class="bdrop__caret" aria-hidden="true"></span>
+            </div>
+            <div class="bdrop__panel">
+              <input type="text" class="bdrop__input" data-drop-input placeholder="输入自定义值，回车确定" aria-label="${esc(f.label)}：搜索或输入自定义值">
+              <div class="bdrop__list" role="listbox">${list.map((o) => `<button type="button" class="bdrop__opt${o === v ? ' is-on' : ''}" data-sel-opt="${esc(o)}" role="option" aria-selected="${o === v}">${o === v ? '✓ ' : ''}${esc(o)}</button>`).join('')}<span class="bdrop__none" hidden></span></div>
+            </div>
+          </div>
+          <input type="hidden" id="${uid}" data-field="${f.k}" value="${esc(v)}">
+          ${hint}
+        </div>`;
+    }
+    /** 必填 / 选填 各成一个通栏区块，区块内部再排字段网格。
+        之前标题和「展开」按钮是网格里的普通格子，会和字段抢位置、错位到别的列；
+        现在标题通栏、字段只在 .fsec__grid 里，必填与选填左右对齐一致。 */
+    function fieldGroupsHtml(fields, data, cardKey) {
+      const reqFields = fields.filter((f) => f.req);
+      const optFields = fields.filter((f) => !f.req);
+      const filled = optFields.filter((f) => String(data[f.k] == null ? '' : data[f.k]).trim()).length;
+      return `
+        <div class="biz-fields">
+          ${reqFields.length ? `
+          <section class="fsec">
+            <div class="fsec__hd">
+              <span class="fsec__tag is-req">必填</span>
+              <span class="fsec__n">${reqFields.length} 项</span>
+              <span class="fsec__tip">缺一项就保存不了</span>
+            </div>
+            <div class="fsec__grid">${reqFields.map((f) => fieldHtml(f, data[f.k], cardKey, data)).join('')}</div>
+          </section>` : ''}
+          ${optFields.length ? `
+          <section class="fsec" data-opt-sec>
+            <button type="button" class="fsec__hd fsec__hd--btn" data-more aria-expanded="false">
+              <span class="fsec__caret" aria-hidden="true"></span>
+              <span class="fsec__tag is-opt">选填</span>
+              <span class="fsec__n">${optFields.length} 项</span>
+              <span class="fsec__tip" data-opt-tip>${filled ? `已填 ${filled}` : '可先留空，之后再补'}</span>
+            </button>
+            <div class="fsec__body" data-more-body hidden>
+              <div class="fsec__grid">${optFields.map((f) => fieldHtml(f, data[f.k], cardKey, data)).join('')}</div>
+            </div>
+          </section>` : ''}
+        </div>`;
+    }
+    /** 选填区标题上的「已填 x」：下拉/标签改的是隐藏 input，不会冒泡 input 事件，
+        所以改动值的地方统一 dispatch 一次 input（见 wireFields 里的 fireInput）。 */
+    function refreshOptCount(root) {
+      const sec = root.querySelector('[data-opt-sec]');
+      if (!sec) return;
+      const inputs = sec.querySelectorAll('[data-field]');
+      const total = inputs.length;
+      let filled = 0;
+      inputs.forEach((el) => { if (String(el.value == null ? '' : el.value).trim()) filled += 1; });
+      const tip = sec.querySelector('[data-opt-tip]');
+      if (tip) tip.textContent = filled ? `已填 ${filled} / ${total}` : '可先留空，之后再补';
+      const btn = sec.querySelector('[data-more]');
+      if (btn) btn.classList.toggle('has-value', filled > 0);
+    }
+    /** 必填校验：空的标红并聚焦第一个；返回未填字段名列表 */
+    function checkRequired(key, root) {
+      const bad = [];
+      (BIZ_FIELDS[key] || []).filter((f) => f.req).forEach((f) => {
+        const el = root.querySelector(`[data-field="${f.k}"]`);
+        const wrap = el ? el.closest('.field') : null;
+        const ok = !!el && !!String(el.value == null ? '' : el.value).trim();
+        if (wrap) wrap.classList.toggle('is-err', !ok);
+        if (!ok) bad.push(f);
+      });
+      return bad;
+    }
+    function focusField(el) {
+      if (!el) return;
+      const wrap = el.closest('.field');
+      const box = wrap && wrap.querySelector('.bdrop__box');
+      const target = (el.type === 'hidden' && box) ? box : el;
+      try { target.focus({ preventScroll: true }); } catch (e) { target.focus(); }
+      if (wrap && wrap.scrollIntoView) wrap.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+    /* ══════════ 记录集卡片（业务画像 / 产品知识库 / 目标客户 / 微信转化）══════════
+       每张卡片支持多条记录：上面是记录列表，下面是表单。
+       「新增」→ 空表单 → 保存时另存一条，不覆盖已有记录；点列表里的「编辑」则改那一条。
+       其中带「主」标记的是主记录，话术变量与 AI 生成都取它。 */
+    const RECORD_CARDS = ['business', 'product', 'audience', 'wechat'];
+    const EMPTY_RECORD = {
+      business: { conversionGoal: '添加微信', tone: '专业、真诚' },
+      product: {}, audience: {}, wechat: {},
+    };
+
+    /** 列表里每条记录的标题：取最能代表这张卡片的一个字段 */
+    function recTitle(key, rec) {
+      const r = rec || {};
+      if (key === 'business') return [r.industry, r.targetCustomer].filter(Boolean).join(' · ');
+      if (key === 'product') return r.productName || '';
+      if (key === 'audience') return r.name || '';
+      if (key === 'wechat') return r.wechatId ? ('微信号 ' + r.wechatId) : '';
+      return '';
+    }
+    /** 列表里第二条信息：帮助区分同名记录 */
+    function recSub(key, rec) {
+      const r = rec || {};
+      if (key === 'business') return [r.serviceArea, r.selfIntro].filter(Boolean).join(' · ');
+      if (key === 'product') return [r.priceRange, splitLines(r.sellingPoints)[0]].filter(Boolean).join(' · ');
+      if (key === 'audience') return [r.region, splitLines(r.needs)[0]].filter(Boolean).join(' · ');
+      if (key === 'wechat') return [r.guideTiming, r.guideReason].filter(Boolean).join(' · ');
+      return '';
+    }
+    const fmtStamp = (s) => {
+      if (!s) return '';
+      const d = new Date(s);
+      if (isNaN(d.getTime())) return '';
+      const p = (n) => String(n).padStart(2, '0');
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    };
+
+    function stOf(key) {
+      if (!wiz.cards[key]) {
+        wiz.cards[key] = { records: [], primaryId: null, editingId: null, creating: false, data: {} };
+      }
+      return wiz.cards[key];
     }
 
-    function renderStep() {
-      if (!document.getElementById('biz-panel')) return;
-      paintSteps();
-      panel.innerHTML = `<div class="wizard__panel">${stepHtml(wiz.step)}</div>`;
-
-      const foot = document.createElement('div');
-      foot.className = 'wizard__foot';
-      const last = wiz.step === BIZ_STEPS.length - 1;
-      foot.innerHTML = (wiz.step > 0
-        ? '<button type="button" class="btn" id="bz-prev">← 上一步</button>'
-        : '<button type="button" class="btn" id="bz-skip">跳过</button>')
-        + (last
-          ? '<button type="button" class="btn btn--primary btn--lg" id="bz-finish">✓ 完成并保存</button>'
-          : '<button type="button" class="btn btn--primary btn--lg" id="bz-next">保存并下一步 →</button>');
-      panel.appendChild(foot);
-
-      const prev = $('#bz-prev');
-      if (prev) prev.addEventListener('click', () => { collect(wiz.step); goStep(wiz.step - 1); });
-
-      const next = $('#bz-next');
-      if (next) next.addEventListener('click', async () => {
-        if (wiz.busy) return;
-        wiz.busy = true; next.disabled = true;
-        const label = BIZ_STEPS[wiz.step].label;
-        try {
-          const r = await saveStep(wiz.step);
-          toast(r.skipped ? label + '未改动，直接进入下一步' : '已保存：' + label, r.skipped ? '' : 'ok');
-          await loadStatus();
-          goStep(wiz.step + 1);
-        } catch (e) {
-          toast('保存失败：' + e.message, 'warn');
-          next.disabled = false;
-        } finally { wiz.busy = false; }
-      });
-
-      const finish = $('#bz-finish');
-      if (finish) finish.addEventListener('click', async () => {
-        if (wiz.busy) return;
-        wiz.busy = true; finish.disabled = true;
-        const label = BIZ_STEPS[wiz.step].label;
-        try {
-          const r = await saveStep(wiz.step);
-          if (!r.skipped) toast('已保存：' + label, 'ok');
-          await loadStatus();
-          renderDone();
-        } catch (e) {
-          toast('保存失败：' + e.message, 'warn');
-          finish.disabled = false;
-        } finally { wiz.busy = false; }
-      });
-
-      const skip = $('#bz-skip');
-      if (skip) skip.addEventListener('click', () => {
-        openModal(`
-          <h2 id="modal-title">跳过业务配置</h2>
-          <p style="font-size:13px;color:var(--ink-soft);margin-bottom:14px">
-            跳过不影响采集，但 AI 话术、线索分级和私信策略会缺少业务上下文，效果会打折。可随时回来补填。
-          </p>
-          <div class="modal__foot">
-            <button type="button" class="btn" data-close>继续填写</button>
-            <button type="button" class="btn btn--primary" id="bz-skip-ok">确认跳过</button>
-          </div>`);
-        $('#bz-skip-ok').addEventListener('click', async () => {
-          try { await API.skipOnboarding(true); toast('已跳过，可随时回来补填'); }
-          catch (e) { toast('跳过失败：' + e.message, 'warn'); }
-          closeModal();
-          await loadStatus();
-        });
-      });
-    }
-
-    function renderDone() {
-      const s = wiz.status || { doneCount: 0, total: 5 };
-      paintSteps();
-      $$('#biz-steps .wizard__step').forEach((el) => {
-        el.className = 'wizard__step wizard__step--done';
-        el.querySelector('.wizard__step-no').textContent = '✓';
-      });
-      const all = s.doneCount >= s.total;
-      panel.innerHTML = `
-        <div class="wizard__panel" style="text-align:center;padding:16px 0">
-          <div class="empty__ico" style="margin:0 auto 8px">${ico('rocket', 'ico--brand')}</div>
-          <h2 style="font-family:var(--font-display);font-size:20px;margin:8px 0 6px">业务配置已保存</h2>
-          <p style="font-size:13px;color:var(--ink-soft);max-width:440px;margin:0 auto 6px">
-            已完成 <b>${s.doneCount}/${s.total}</b> 步。这些配置将作为 AI 话术、线索分级与私信策略的依据。
-          </p>
-          <p style="font-size:12px;color:var(--ink-faint);max-width:440px;margin:0 auto 18px">
-            ${all ? '5 步全部完成。接下来可以去「账号管理 → 上线向导」把系统跑起来。' : '还有 ' + (s.total - s.doneCount) + ' 步未填，可随时回来补全。'}
-          </p>
-          <div style="display:flex;gap:10px;justify-content:center">
-            <a class="btn btn--primary" href="#/accounts?tab=wizard">去上线向导 →</a>
-            <button type="button" class="btn" id="bz-again">回到向导</button>
+    /** 记录列表：每条记录一行，平铺在卡片里（主记录加「主」徽标 + 高亮）。
+        超过 3 条时，前 3 条直出，其余收在「展开全部 N 条」后面 —— 就是一个可展开的长列表，
+        不用浮层、不用切换器。 */
+    function recordsHtml(key) {
+      const st = stOf(key);
+      if (!st.records.length) {
+        return `<div class="biz-recs"><div class="biz-recs__empty">还没有记录。点右上角「+ 新增」，在弹出的表单里填好后保存。</div></div>`;
+      }
+      const rowHtml = (r) => {
+        const title = recTitle(key, r) || '未命名记录';
+        const sub = recSub(key, r);
+        return `<div class="biz-rec${r.isPrimary ? ' is-cur' : ''}">
+          <span class="biz-rec__badge${r.isPrimary ? ' is-main' : ''}">${r.isPrimary ? '主' : ''}</span>
+          <div class="biz-rec__main">
+            <b>${esc(title)}</b>
+            ${sub ? `<span class="biz-rec__sub">${esc(sub)}</span>` : ''}
+          </div>
+          <span class="biz-rec__time">${esc(fmtStamp(r.updatedAt))}</span>
+          <div class="biz-rec__acts">
+            ${r.isPrimary ? '' : `<button type="button" class="btn btn--sm" data-primary="${key}" data-id="${esc(r.id)}">设为主</button>`}
+            <button type="button" class="btn btn--sm" data-edit="${key}" data-id="${esc(r.id)}">编辑</button>
+            <button type="button" class="btn btn--sm btn--danger" data-del="${key}" data-id="${esc(r.id)}">删除</button>
           </div>
         </div>`;
-      const again = $('#bz-again');
-      if (again) again.addEventListener('click', () => goStep(0));
+      };
+      const HEAD = 3;
+      const total = st.records.length;
+      const many = total > HEAD;
+      return `<div class="biz-recs">
+        ${st.records.slice(0, HEAD).map(rowHtml).join('')}
+        ${many ? `<div class="biz-recs__rest" data-rest="${key}" hidden>${st.records.slice(HEAD).map(rowHtml).join('')}</div>
+        <button type="button" class="biz-recs__more" data-rectoggle="${key}" aria-expanded="false">展开全部 ${total} 条<span class="biz-recs__caret"></span></button>` : ''}
+      </div>`;
     }
 
-    async function goStep(i) {
-      wiz.step = Math.max(0, Math.min(BIZ_STEPS.length - 1, i));
-      const key = BIZ_STEPS[wiz.step].key;
-      if (wiz.data[key] === undefined) {
-        paintSteps();
-        panel.innerHTML = '<div class="wizard__panel"><div class="empty"><p>加载配置中…</p></div></div>';
-        try {
-          wiz.data[key] = await BIZ_LOADERS[key]();
-        } catch (e) {
-          wiz.data[key] = {};
-          toast('配置加载失败，从空白开始：' + e.message, 'warn');
-        }
-        wiz.snapshot[key] = JSON.stringify(wiz.data[key]);
-      }
-      renderStep();
+    /** 展开 / 收起记录列表的尾部。纯 DOM 切换，不重新拉数据。 */
+    function toggleRecList(btn) {
+      const card = btn.closest('[data-card]');
+      const rest = card && card.querySelector('[data-rest]');
+      if (!rest) return;
+      const open = rest.hidden;
+      rest.hidden = !open;
+      btn.setAttribute('aria-expanded', String(open));
+      btn.classList.toggle('is-open', open);
+      const st = stOf(card.dataset.card);
+      btn.innerHTML = (open ? '收起' : '展开全部 ' + st.records.length + ' 条') + '<span class="biz-recs__caret"></span>';
     }
+
+    /* ══════════ 新增 / 编辑弹窗 ══════════
+       页面上只留记录列表，表单全部收进弹窗：新增=空表单（另存一条，不覆盖），
+       编辑=带该条数据（只更新这一条）。保存后关闭弹窗并刷新列表。 */
+    function openFormModal(key, rec) {
+      const i = BIZ_STEPS.findIndex((st) => st.key === key);
+      const meta = BIZ_STEP_META[key] || {};
+      const label = i >= 0 ? BIZ_STEPS[i].label : key;
+      const fields = BIZ_FIELDS[key] || [];
+      const editing = !!(rec && rec.id);
+      const data = Object.assign({}, EMPTY_RECORD[key], rec || {});
+      openModal(`
+        <h2>${editing ? '编辑' : '新增'} · ${esc(label)}</h2>
+        <p class="modal__lede">${esc(meta.desc || '')}${editing ? '' : '　保存后会新增一条记录，不会覆盖已有的。'}</p>
+        <div class="biz-form biz-form--modal" data-card="${key}">
+          ${fieldGroupsHtml(fields, data, key)}
+          <div class="modal__foot">
+            <button type="button" class="btn" data-close>取消</button>
+            <button type="button" class="btn btn--primary" data-save>${editing ? '保存修改' : '新增并保存'}</button>
+          </div>
+        </div>`, { wide: true, variant: 'biz' });
+
+      const root = $('#modal .biz-form');
+      if (!root) return;
+      wireFields(root);
+
+      // 选填折叠：事件委托挂在表单容器上，点 [data-more] 切换 body 的 hidden
+      root.addEventListener('click', (e) => {
+        const t = e.target.closest('[data-more]');
+        if (!t) return;
+        const body = root.querySelector('[data-more-body]');
+        if (body) { body.hidden = !body.hidden; t.setAttribute('aria-expanded', String(!body.hidden)); }
+      });
+      // 编辑已有记录时，选填区有内容就直接展开，避免「填过的内容看起来像没填」；
+      // 新增时保持收起，表单不至于一打开就很长。
+      const optBody = root.querySelector('[data-more-body]');
+      const optBtn = root.querySelector('[data-more]');
+      if (editing && optBody && optBtn && optBody.querySelectorAll('[data-field]').length) {
+        const hasVal = Array.from(optBody.querySelectorAll('[data-field]'))
+          .some((el) => String(el.value == null ? '' : el.value).trim());
+        if (hasVal) { optBody.hidden = false; optBtn.setAttribute('aria-expanded', 'true'); }
+      }
+      // 输入即更新「已填 x」、并清掉该字段的必填标红
+      root.addEventListener('input', (e) => {
+        const wrap = e.target.closest && e.target.closest('.field');
+        if (wrap) wrap.classList.remove('is-err');
+        refreshOptCount(root);
+      });
+      refreshOptCount(root);
+      const btn = root.querySelector('[data-save]');
+      btn.addEventListener('click', () => submitForm(key, rec, root, btn));
+    }
+
+    async function submitForm(key, rec, root, btn) {
+      if (wiz.busy) return;
+      const bad = checkRequired(key, root);
+      if (bad.length) {
+        toast('还有 ' + bad.length + ' 项必填没填：' + bad.map((f) => f.label).join('、'), 'warn');
+        focusField(root.querySelector(`[data-field="${bad[0].k}"]`));
+        return;
+      }
+      wiz.busy = true;
+      const old = btn.textContent;
+      btn.disabled = true; btn.textContent = '保存中…';
+      try {
+        const data = collectCard(root);
+        const label = (BIZ_STEPS.find((s) => s.key === key) || {}).label || key;
+        if (rec && rec.id) {
+          await API.updateProfileRecord(key, rec.id, data);
+          toast('已保存：' + label, 'ok');
+        } else {
+          await API.createProfileRecord(key, data);
+          toast('已新增一条「' + label + '」记录（并设为主记录）', 'ok');
+        }
+        invalidateProfileCtx();
+        closeModal();
+        await loadAll();
+        await loadStatus();
+        renderCards();
+      } catch (e) {
+        toast('保存失败：' + e.message, 'warn');
+        btn.disabled = false; btn.textContent = old;
+      } finally { wiz.busy = false; }
+    }
+
+    function cardHtml(key) {
+      const i = BIZ_STEPS.findIndex((st) => st.key === key);
+      const meta = BIZ_STEP_META[key] || {};
+      const label = i >= 0 ? BIZ_STEPS[i].label : key;
+      const st = stOf(key);
+      return `
+        <div class="card biz-card" data-card="${key}">
+          <div class="biz-card__head">
+            <b class="biz-card__title"><span class="biz-card__no">${i >= 0 ? i + 1 : ''}</span>${esc(label)}</b>
+            <span class="biz-card__desc">${esc(meta.desc || '')}</span>
+            <span class="biz-card__count">${st.records.length} 条</span>
+            <button type="button" class="btn btn--sm btn--primary" data-new="${key}">+ 新增</button>
+          </div>
+          ${recordsHtml(key)}
+        </div>`;
+    }
+
+    /** 拉取 4 张卡片的记录集 */
+    async function loadAll() {
+      await Promise.all(RECORD_CARDS.map(async (key) => {
+        const st = stOf(key);
+        let res = null;
+        try { res = await API.listProfileRecords(key); } catch (e) { res = null; }
+        const items = (res && (res.items || res)) || [];
+        st.records = Array.isArray(items) ? items : [];
+        st.primaryId = (res && res.primaryId)
+          || (st.records.find((r) => r.isPrimary) || {}).id || null;
+
+        if (st.creating) {
+          st.data = Object.assign({}, EMPTY_RECORD[key], st.data);
+        } else {
+          let cur = st.records.find((r) => r.id === st.editingId);
+          if (!cur) cur = st.records.find((r) => r.id === st.primaryId) || st.records[0] || null;
+          st.editingId = cur ? cur.id : null;
+          st.data = Object.assign({}, EMPTY_RECORD[key], cur || {});
+        }
+        wiz.data[key] = st.data;
+      }));
+    }
+
+    /** 只重建卡片 DOM（不重新拉数据），供列表内操作后刷新 */
+    function renderCards() {
+      panel.innerHTML = `
+        <div class="biz-grid">
+          ${cardHtml('business')}
+          ${cardHtml('product')}
+          ${cardHtml('audience')}
+          ${cardHtml('wechat')}
+        </div>`;
+      wireCards();
+    }
+
+    function wireCards() {
+      $$('#biz-panel [data-card]').forEach((card) => {
+        const key = card.dataset.card;
+        if (!RECORD_CARDS.includes(key)) return;
+        const st = stOf(key);
+
+        const newBtn = card.querySelector('[data-new]');
+        if (newBtn) newBtn.addEventListener('click', () => openFormModal(key, null));
+
+        // 记录列表尾部「展开全部 / 收起」
+        const recToggle = card.querySelector('[data-rectoggle]');
+        if (recToggle) recToggle.addEventListener('click', () => toggleRecList(recToggle));
+
+        card.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => {
+          const rec = st.records.find((r) => r.id === b.dataset.id) || null;
+          if (rec) openFormModal(key, rec);
+        }));
+        card.querySelectorAll('[data-primary]').forEach((b) => b.addEventListener('click', async () => {
+          try {
+            await API.setPrimaryProfileRecord(key, b.dataset.id);
+            await loadAll();
+            renderCards();
+            toast('已设为主记录（话术变量与 AI 生成改用这条）', 'ok');
+          } catch (e) { toast('设置失败：' + e.message, 'warn'); }
+        }));
+        card.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+          const rec = st.records.find((r) => r.id === b.dataset.id) || {};
+          const name = recTitle(key, rec) || '未命名记录';
+          if (!window.confirm('删除记录「' + name + '」？删除后不可恢复。')) return;
+          try {
+            await API.deleteProfileRecord(key, b.dataset.id);
+            st.editingId = null;
+            await loadAll();
+            await loadStatus();
+            renderCards();
+            toast('已删除记录', 'ok');
+          } catch (e) { toast('删除失败：' + e.message, 'warn'); }
+        }));
+      });
+    }
+
+    /** 绑定自研下拉：单选（选中即收起）/ 多选标签（点选即加、胶囊 × 移除、可输入自定义） */
+    function wireFields(card) {
+      card.querySelectorAll('.bdrop').forEach((drop) => {
+        const field = drop.closest('.field');
+        if (!field) return;
+        const hidden = field.querySelector('input[data-field]');
+        if (!hidden) return;
+        // 下拉/标签改的是隐藏 input，不会自己冒泡事件；
+        // 手动派发一次，让上层的「已填计数」「清掉标红」能感知到。
+        const fireInput = () => hidden.dispatchEvent(new Event('input', { bubbles: true }));
+        const panelEl = drop.querySelector('.bdrop__panel');
+        const toggle = drop.querySelector('[data-drop-toggle]');
+        const input = drop.querySelector('[data-drop-input]');
+        const isTags = field.hasAttribute('data-tags');
+        const ph = field.dataset.ph || '请选择或输入';
+        const max = field.dataset.max ? parseInt(field.dataset.max, 10) : 0;
+        // 面板内点击不冒泡到 document，否则会被"点外部关闭"立刻收起
+        panelEl.addEventListener('click', (e) => e.stopPropagation());
+        // 面板里输入即过滤候选；过滤到 0 条时，空态文案改成「回车添加自定义值」
+        function applyFilter() {
+          const listBox = panelEl.querySelector('.bdrop__list');
+          if (!listBox) return;
+          const q = String(input ? input.value : '').trim().toLowerCase();
+          let hit = 0;
+          listBox.querySelectorAll('[data-sel-opt], [data-tag-add]').forEach((b) => {
+            const t = String(b.dataset.selOpt || b.dataset.tagAdd || '').toLowerCase();
+            const on = !q || t.indexOf(q) >= 0;
+            b.hidden = !on;
+            if (on) hit += 1;
+          });
+          const noneEl = listBox.querySelector('.bdrop__none');
+          if (!noneEl) return;
+          noneEl.hidden = hit > 0;
+          if (hit) return;
+          noneEl.textContent = q
+            ? `没有匹配项，回车添加「${String(input.value).trim()}」`
+            : (isTags ? '常用项都已选完，可直接输入自定义值' : '暂无可选清单，直接输入自定义值');
+        }
+        if (input) {
+          input.addEventListener('input', applyFilter);
+          // Esc 只收面板，不关弹窗（escClose 已处理，这里再兜一次避免冒泡）
+          input.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            e.stopPropagation();
+            setOpen(false);
+          });
+        }
+        // 键盘：聚焦触发框后回车/空格/下箭头都能展开
+        if (toggle) {
+          toggle.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') {
+              e.preventDefault();
+              if (isOpen()) { setOpen(false); return; }
+              openPanel();
+            }
+          });
+        }
+
+        const setOpen = (on) => {
+          drop.classList.toggle('is-open', !!on);
+          if (toggle) toggle.setAttribute('aria-expanded', on ? 'true' : 'false');
+        };
+        const isOpen = () => drop.classList.contains('is-open');
+        // 展开前先按表单当前值刷新选项（例：「主营产品」要跟着刚选的行业变）。
+        // 弹窗是滚动容器，字段贴着上/下边时面板会被裁掉：先量出面板自然高度，
+        // 能放下就向下弹；下方不够但上方够就向上弹；两边都不够就压缩选项列表，
+        // 保证面板整体落在容器内。右列字段若向右溢出，改为贴右对齐。
+        let refreshOnOpen = () => {};
+        const openPanel = () => {
+          closeAllDrops(drop);
+          if (input) { input.value = ''; input.focus({ preventScroll: true }); }
+          refreshOnOpen();
+          const listEl = panelEl.querySelector('.bdrop__list');
+          if (listEl) listEl.style.maxHeight = '';
+          drop.classList.remove('is-up');
+          setOpen(true);
+          applyFilter();
+
+          const scroller = drop.closest('.modal');
+          const base = scroller ? scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+          const r = drop.getBoundingClientRect();
+          const h = panelEl.offsetHeight;
+          const below = (base.bottom - r.bottom) - 6;
+          const above = (r.top - base.top) - 6;
+          const useUp = h > below && above > below;
+          if (useUp) drop.classList.add('is-up');
+          const avail = useUp ? above : below;
+          if (h > avail && listEl) {
+            // 固定部分（内边距 + 自定义输入框 + 底部条）约 110px
+            listEl.style.maxHeight = Math.max(56, Math.round(avail - 110)) + 'px';
+          }
+          const cr = (scroller || document.documentElement).getBoundingClientRect();
+          drop.classList.toggle('is-right', panelEl.getBoundingClientRect().right > cr.right - 6);
+        };
+        toggle.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (isOpen()) { setOpen(false); return; }
+          openPanel();
+        });
+        // 多选标签里胶囊自带「×」，点框体中间容易误删；给一个明确的「＋ 选择」入口
+        const openBtn = drop.querySelector('[data-drop-open]');
+        if (openBtn) openBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (isOpen()) { setOpen(false); return; }
+          openPanel();
+        });
+
+        if (!isTags) {
+          /* ── 单选下拉 ── */
+          const valEl = drop.querySelector('[data-val]');
+          const listBox = drop.querySelector('.bdrop__list');
+          const setVal = (next) => {
+            hidden.value = next || '';
+            if (valEl) {
+              valEl.textContent = next || ph;
+              valEl.classList.toggle('is-empty', !next);
+            }
+            listBox.querySelectorAll('[data-sel-opt]').forEach((b) => {
+              const on = b.dataset.selOpt === next;
+              b.classList.toggle('is-on', on);
+              b.textContent = (on ? '✓ ' : '') + b.dataset.selOpt;
+              b.setAttribute('aria-selected', on ? 'true' : 'false');
+            });
+            fireInput();
+          };
+          const renderOpts = () => {
+            const cur = hidden.value;
+            const base = resolveOpts(field.dataset.opt, card.dataset.card, collectCard(card));
+            const list = (cur && !base.includes(cur)) ? [cur].concat(base) : base;
+            listBox.innerHTML = list.map((o) => `<button type="button" class="bdrop__opt${o === cur ? ' is-on' : ''}" data-sel-opt="${esc(o)}" role="option" aria-selected="${o === cur}">${o === cur ? '✓ ' : ''}${esc(o)}</button>`).join('')
+              + '<span class="bdrop__none" hidden></span>';
+            listBox.querySelectorAll('[data-sel-opt]').forEach((b) => b.addEventListener('click', (e) => {
+              e.stopPropagation();
+              setVal(b.dataset.selOpt);
+              input.value = '';
+              setOpen(false);
+            }));
+            applyFilter();
+          };
+          renderOpts();
+          refreshOnOpen = renderOpts;
+          input.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            const t = input.value.trim();
+            if (!t) return;
+            setVal(t);
+            input.value = '';
+            applyFilter();
+            setOpen(false);
+          });
+          return;
+        }
+
+        /* ── 多选标签 ── */
+        const sep = sepFromCode(field.dataset.tagsep);
+        const fdef = (BIZ_FIELDS[card.dataset.card] || []).find((x) => x.k === field.dataset.tags) || {};
+        const label = fdef.label || field.dataset.tags || '该字段';
+        const getCur = () => splitBySep(hidden.value, sep);
+        const refresh = () => {
+          const cur = getCur();
+          // 有胶囊时才显示「＋ 选择」：空框已有占位文字提示，不必重复
+          drop.classList.toggle('has-tags', cur.length > 0);
+          const box = drop.querySelector('[data-tagbox]');
+          box.innerHTML = cur.length
+            ? cur.map((t) => `<span class="bchip">${esc(t)}<button type="button" class="bchip__x" data-tag-del="${esc(t)}" title="移除「${esc(t)}」" aria-label="移除「${esc(t)}」">×</button></span>`).join('')
+            : `<span class="bdrop__ph">${esc(ph)}</span>`;
+          box.querySelectorAll('[data-tag-del]').forEach((b) => b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            hidden.value = getCur().filter((x) => x !== b.dataset.tagDel).join(sep);
+            refresh();
+            fireInput();
+          }));
+          const rest = resolveOpts(field.dataset.opt, card.dataset.card, collectCard(card)).filter((o) => !cur.includes(o));
+          const listBox = drop.querySelector('.bdrop__list');
+          listBox.innerHTML = rest.map((o) => `<button type="button" class="bdrop__opt" data-tag-add="${esc(o)}" role="option" aria-selected="false">${esc(o)}</button>`).join('')
+            + '<span class="bdrop__none" hidden></span>';
+          listBox.querySelectorAll('[data-tag-add]').forEach((b) => b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const cur2 = getCur();
+            const t = b.dataset.tagAdd;
+            if (cur2.includes(t)) return;
+            if (max && cur2.length >= max) { toast('「' + label + '」最多选 ' + max + ' 项', 'warn'); return; }
+            hidden.value = cur2.concat([t]).join(sep);
+            refresh();
+            fireInput();
+          }));
+          const tipEl = drop.querySelector('.bdrop__tip');
+          if (tipEl) tipEl.textContent = max ? `已选 ${cur.length} / ${max}` : (cur.length ? `已选 ${cur.length} 项` : '可多选');
+          applyFilter();
+        };
+        refresh();
+        refreshOnOpen = refresh;
+        // 一键清空已选
+        const clearBtn = drop.querySelector('[data-tag-clear]');
+        if (clearBtn) clearBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (!getCur().length) return;
+          hidden.value = '';
+          refresh();
+          fireInput();
+        });
+        input.addEventListener('keydown', (e) => {
+          if (e.key !== 'Enter') return;
+          e.preventDefault();
+          const t = input.value.trim();
+          if (!t) return;
+          const cur = getCur();
+          if (!cur.includes(t)) {
+            if (max && cur.length >= max) { toast('「' + label + '」最多选 ' + max + ' 项', 'warn'); input.value = ''; applyFilter(); return; }
+            hidden.value = cur.concat([t]).join(sep);
+            refresh();
+            fireInput();
+          }
+          input.value = '';
+          applyFilter();
+        });
+        const done = drop.querySelector('[data-drop-done]');
+        if (done) done.addEventListener('click', (e) => { e.stopPropagation(); setOpen(false); });
+      });
+
+      // 点面板外任意处收起（只绑一次）
+      if (!document.body.dataset.bizDropBound) {
+        document.body.dataset.bizDropBound = '1';
+        document.addEventListener('click', () => closeAllDrops(null));
+      }
+    }
+
+    async function paint() {
+      await loadAll();
+      renderCards();
+    }
+
 
     await loadStatus();
-    await goStep(0);
+    await paint();
   }
 
   /* ═══════════════════════════════════════════
@@ -5945,6 +8638,7 @@
                 statusBar('is-bad', '登录 / 试采失败', live.errorMessage || '请看采集服务状态');
               } else {
                 statusBar('is-ok', '登录成功', '抖音扫码登录已完成，可以继续');
+                try { await API.syncDouyinAccount(); } catch (_) { /* 无登录态时忽略，账号列表仅在扫码成功后出现 */ }
               }
               await refreshAccounts();
             }
@@ -6138,8 +8832,8 @@
       try {
         const [scripts, strategy, compliance] = await Promise.all([
           API.getScripts().catch(() => []),
-          API.fetchStrategySettings().catch(() => null),
-          API.fetchComplianceSettings().catch(() => null),
+          (window.API && window.API.fetchStrategySettings ? window.API.fetchStrategySettings() : Promise.resolve(null)).catch(() => null),
+          (window.API && window.API.fetchComplianceSettings ? window.API.fetchComplianceSettings() : Promise.resolve(null)).catch(() => null),
         ]);
         wiz.scripts = scripts || [];
         if (strategy && strategy.daily_frequency_limit != null) wiz.dailyLimit = strategy.daily_frequency_limit;
@@ -6365,10 +9059,184 @@
   /* ═══════════════════════════════════════════
      视图：采集配置（MediaCrawler 采集任务管理）
      ═══════════════════════════════════════════ */
-  const crawlState = { tasks: [], polling: null, busy: false };
+  const crawlState = {
+    tasks: [],
+    polling: null,
+    busy: false,
+    filter: { q: '', status: 'all', type: 'all', sort: 'recent' },
+    modalId: null,          // 详情弹窗当前展示的任务 id（轮询时原地刷新）
+    diag: { items: [], blocking: [], expanded: null, lastError: '', loaded: false },
+  };
+
+  /* ══════════ 环境检查（可展开清单） ══════════
+     不再把一整段「MediaCrawler 未启动或未登录抖音…」糊在页面上：
+     页面只留一行摘要，具体哪一项没就绪、怎么修，点开清单逐条看。 */
+  const DIAG_ACTION = {
+    start_crawl_service: () => { toast('正在拉起采集服务…'); API.startCrawlService && API.startCrawlService(); },
+    goto_step: (a) => { location.hash = '#/accounts?tab=wizard&step=' + (a.step || 0); },
+  };
+
+  /** 拉取环境自检结果并渲染清单（不打 toast、不弹窗） */
+  async function loadDiag() {
+    const box = $('#crawl-diag');
+    if (!box) return null;
+    let rd = null;
+    try { rd = await API.getReadiness(); } catch (e) { rd = null; }
+    const d = crawlState.diag;
+    if (rd && rd.items) {
+      d.items = rd.items;
+      d.blocking = rd.blocking || [];
+      d.loaded = true;
+    } else {
+      d.items = [];
+      d.blocking = [];
+      d.loaded = false;
+    }
+    renderDiag();
+    return d.blocking.length === 0;
+  }
+
+  function renderDiag() {
+    const box = $('#crawl-diag');
+    if (!box) return;
+    const d = crawlState.diag;
+    const items = d.items.slice();
+    if (d.lastError) {
+      items.unshift({ key: 'last_error', label: '上一次启动', ok: false, detail: d.lastError, action: null, link: null });
+    }
+    const bad = items.filter((i) => i.ok === false);
+    // 默认收起（整段隐藏）：未展开就不显示任何提示，页面保持干净。
+    // 有问题时页头「环境检查」按钮显示红点，用户点击才展开。
+    // 仅当某个操作真正失败（diagFail / ensureDouyinLogin）才主动展开。
+    if (d.expanded === null) d.expanded = false;
+    const expanded = !!d.expanded;
+
+    // 收起时整段隐藏：未展开就不显示「MediaCrawler 未启动…」这类提示
+    box.hidden = !expanded;
+    const ico = $('#crawl-diag-ico'), stat = $('#crawl-diag-stat');
+    if (ico) { ico.textContent = bad.length ? '!' : '✓'; ico.className = 'diag__ico ' + (bad.length ? 'is-bad' : 'is-ok'); }
+    if (stat) {
+      stat.textContent = !d.loaded
+        ? '自检服务未响应'
+        : bad.length
+          ? `${bad.length} 项待处理 · ${items.length - bad.length} 项就绪`
+          : `${items.length} 项全部就绪`;
+      stat.className = 'diag__stat ' + (bad.length ? 'is-bad' : 'is-ok');
+    }
+    const toggle = $('#crawl-diag-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(expanded));
+    const list = $('#crawl-diag-list');
+    if (!list) return;
+    list.hidden = !expanded;
+
+    if (!d.loaded) {
+      list.innerHTML = `<li class="diag__item"><span class="diag__dot is-bad"></span>
+        <span class="diag__body"><span class="diag__label">环境自检</span>
+        <span class="diag__detail">无法读取自检结果，请确认后端服务在运行。</span></span></li>`;
+      return;
+    }
+
+    list.innerHTML = items.map((i) => {
+      const ok = i.ok !== false;
+      const act = i.action
+        ? `<button type="button" class="btn btn--sm ${ok ? '' : 'btn--primary'}" data-diag-act="${esc(i.key)}">${esc(i.action.label || '处理')}</button>`
+        : (i.link ? `<a class="btn btn--sm" data-close href="${esc(i.link)}">去配置</a>` : '');
+      return `<li class="diag__item">
+        <span class="diag__dot ${ok ? 'is-ok' : 'is-bad'}"></span>
+        <span class="diag__body">
+          <span class="diag__label">${esc(i.label || i.key)}</span>
+          <span class="diag__detail">${esc(i.detail || '')}</span>
+        </span>
+        ${act ? `<span class="diag__act">${act}</span>` : ''}
+      </li>`;
+    }).join('');
+
+    $$('[data-diag-act]', list).forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const it = items.find((x) => x.key === btn.dataset.diagAct);
+        const fn = it && it.action && DIAG_ACTION[it.action.type];
+        if (fn) fn(it.action);
+        else if (it && it.link) location.hash = it.link;
+        else { location.hash = '#/accounts?tab=wizard'; }
+      });
+    });
+
+    // 同步页头「环境检查」按钮的状态点（始终可见，作为展开入口）
+    const dot = $('#crawl-diag-open-dot');
+    if (dot) dot.className = 'dot ' + (bad.length ? 'is-bad' : (d.loaded ? 'is-ok' : 'is-warn'));
+  }
+
+  /** 启动失败：把原因收进清单并展开，不再弹一大段文案 */
+  function diagFail(msg) {
+    crawlState.diag.lastError = String(msg || '').slice(0, 240);
+    crawlState.diag.expanded = true;
+    renderDiag();
+    const box = $('#crawl-diag');
+    if (box) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    toast('启动失败，已展开环境检查', 'warn');
+  }
+
+  const CRAWL_STATUS = {
+    pending: { label: '待启动', cls: 'status-pill--muted' },
+    running: { label: '采集中', cls: 'status-pill--running' },
+    completed: { label: '已完成', cls: 'status-pill--ok' },
+    failed: { label: '失败', cls: 'status-pill--danger' },
+  };
+
+  /** 采集任务：绝对时间 2026-09-13 06:44 */
+  function crawlDateTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '—';
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  /** 把 crawlState.filter 同步回工具栏控件（用于「清空筛选」后复位） */
+  function syncCrawlToolbar() {
+    const f = crawlState.filter;
+    const q = $('#crawl-q');
+    const type = $('#crawl-type');
+    const sort = $('#crawl-sort');
+    if (q) q.value = f.q || '';
+    if (type) type.value = f.type || 'all';
+    if (sort) sort.value = f.sort || 'recent';
+  }
+
+  /** 绑定采集页筛选工具栏：搜索 / 状态 chips / 类型 / 排序 */
+  function bindCrawlToolbar() {
+    const q = $('#crawl-q');
+    if (q) {
+      let timer = null;
+      q.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          crawlState.filter.q = q.value;
+          renderCrawlTaskList();
+        }, 200);
+      });
+    }
+    $$('.crawl-toolbar [data-status]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        crawlState.filter.status = btn.dataset.status;
+        renderCrawlTaskList();
+      });
+    });
+    const type = $('#crawl-type');
+    if (type) type.addEventListener('change', () => {
+      crawlState.filter.type = type.value;
+      renderCrawlTaskList();
+    });
+    const sort = $('#crawl-sort');
+    if (sort) sort.addEventListener('change', () => {
+      crawlState.filter.sort = sort.value;
+      renderCrawlTaskList();
+    });
+  }
 
   async function viewCrawl() {
     if (crawlState.polling) { clearInterval(crawlState.polling); crawlState.polling = null; }
+    crawlState.modalId = null;
 
     main.innerHTML = `
       <div class="view">
@@ -6376,177 +9244,82 @@
           icon: 'i-rocket',
           title: '采集与筛选',
           desc: '从抖音评论区自动采集高意向用户，入库为线索',
-          actions: `<button type="button" class="btn btn--primary" id="crawl-new-btn">${ico('i-rocket')} 新建采集任务</button>`,
+          actions: `
+            <button type="button" class="btn btn--ghost btn--sm" id="crawl-diag-open"
+                    title="环境检查清单：查看采集服务 / 抖音登录 / 账号等就绪情况">
+              <span class="dot" id="crawl-diag-open-dot"></span>环境检查
+            </button>
+            <button type="button" class="btn" id="crawl-reply-btn"
+                    title="自动取你发过评论的视频，批量建检测任务，找出谁在你评论下回复了你">${ico('i-bell')} 检测谁回复了我</button>
+            <button type="button" class="btn btn--primary" id="crawl-new-btn">${ico('i-rocket')} 新建采集任务</button>`,
         })}
 
-        <div class="confirm-note" id="crawl-login-banner" style="display:none;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
-          <span>⚠ 抖音尚未登录，点「启动采集」会失败，请先扫码登录。</span>
-          <button type="button" class="btn btn--primary btn--sm" id="crawl-go-login">去扫码登录</button>
+        <!-- 环境检查：默认只显示一行摘要，点开是逐项清单 -->
+        <section class="diag" id="crawl-diag" hidden>
+          <button type="button" class="diag__summary" id="crawl-diag-toggle" aria-expanded="false" aria-controls="crawl-diag-list">
+            <span class="diag__ico" id="crawl-diag-ico" aria-hidden="true">•</span>
+            <span class="diag__title">环境检查</span>
+            <span class="diag__stat" id="crawl-diag-stat">检测中…</span>
+            <span class="diag__arrow" aria-hidden="true">▸</span>
+          </button>
+          <ul class="diag__list" id="crawl-diag-list" hidden></ul>
+        </section>
+
+        <!-- 概览：一眼看清全局，不必翻列表 -->
+        <div class="crawl-kpi" id="crawl-kpi"></div>
+
+        <div class="crawl-toolbar">
+          <input type="search" class="crawl-toolbar__search" id="crawl-q"
+                 placeholder="搜索任务名 / 关键词 / 账号" aria-label="搜索采集任务">
+          <div class="crawl-segs" role="group" aria-label="按状态筛选">
+            <button type="button" class="filter-chip" data-status="all" aria-pressed="true">全部<span class="count num" data-count="all">0</span></button>
+            <button type="button" class="filter-chip" data-status="running" aria-pressed="false">采集中<span class="count num" data-count="running">0</span></button>
+            <button type="button" class="filter-chip" data-status="pending" aria-pressed="false">待启动<span class="count num" data-count="pending">0</span></button>
+            <button type="button" class="filter-chip" data-status="completed" aria-pressed="false">已完成<span class="count num" data-count="completed">0</span></button>
+            <button type="button" class="filter-chip" data-status="failed" aria-pressed="false">失败<span class="count num" data-count="failed">0</span></button>
+          </div>
+          <div class="crawl-toolbar__right">
+          <span class="crawl-toolbar__count" id="crawl-count"></span>
+          <select class="crawl-toolbar__sort" id="crawl-type" aria-label="按任务类型筛选">
+            <option value="all">全部类型</option>
+            <option value="comment">评论采集</option>
+            <option value="reply_check">回复检测</option>
+          </select>
+          <select class="crawl-toolbar__sort" id="crawl-sort" aria-label="排序方式">
+            <option value="recent">最近创建</option>
+            <option value="progress">进度优先</option>
+            <option value="collected">采集最多</option>
+          </select>
+          </div>
         </div>
 
-        <div class="grid grid--main-side">
-          <div class="card" id="crawl-list-card">
-            <div class="card__head">
-              <span class="card__title">采集任务</span>
-              <span class="card__hint" id="crawl-list-hint">加载中…</span>
-            </div>
-            <div id="crawl-task-list">${emptyState('i-empty', '暂无采集任务，点击右上角新建')}</div>
-          </div>
-
-          <div class="card" style="min-width:320px">
-            <div class="card__head">
-              <span class="card__title">新建任务</span>
-              <span class="card__hint">至少填写一项采集入口</span>
-            </div>
-            <div class="field">
-              <label for="crawl-name">任务名称（可选）</label>
-              <input type="text" id="crawl-name" placeholder="自动生成，如：关键词:装修">
-            </div>
-            <div class="field">
-              <label for="crawl-keyword">搜索关键词</label>
-              <input type="text" id="crawl-keyword" placeholder="例：装修 报价">
-            </div>
-            <div class="field">
-              <label for="crawl-competitor">对标账号</label>
-              <input type="text" id="crawl-competitor" placeholder="抖音昵称或主页URL">
-            </div>
-            <div class="field">
-              <label for="crawl-video">指定视频URL</label>
-              <input type="text" id="crawl-video" placeholder="https://www.douyin.com/video/...">
-            </div>
-            <div class="field">
-              <label for="crawl-source">来源归因</label>
-              <select id="crawl-source">
-                <option value="own_comment">自有视频评论区</option>
-                <option value="competitor">对标账号监控</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="crawl-intent">高意向关键词（逗号分隔，加权评分）</label>
-              <input type="text" id="crawl-intent" placeholder="多少钱,报价,加微信,怎么合作">
-            </div>
-            <div class="field">
-              <label for="crawl-max">最大采集条数</label>
-              <input type="number" id="crawl-max" value="100" min="1" max="10000">
-            </div>
-            <button type="button" class="btn btn--primary btn--block" id="crawl-create-btn">创建任务</button>
-          </div>
-
-          <!-- 检测谁回复了我：开启二级评论采集，只盯你发过评论的视频 -->
-          <div class="card" style="min-width:320px;margin-top:14px;border-color:var(--brand-deep)">
-            <div class="card__head">
-              <span class="card__title">🔍 检测谁回复了我</span>
-              <span class="card__hint">只盯你发过评论的视频</span>
-              <span class="card__spacer"></span>
-              <button type="button" class="btn btn--primary btn--sm" id="crawl-reply-btn">开始检测回复</button>
-            </div>
-            <div style="font-size:12.5px;color:var(--ink-soft)">开启「二级评论」采集识别谁在你评论下又回话了：自动取你发过评论的视频，批量建检测任务并启动。命中后结果回到「待办互动 → 评论回复 → 已回复追踪」，可直接继续回复。</div>
-            <div id="crawl-reply-state" style="font-size:12px;color:var(--ink-soft);margin-top:6px"></div>
-          </div>
-
-        </div>
+        <div class="crawl-grid" id="crawl-task-list">${emptyState('i-empty', '加载中…')}</div>
       </div>`;
 
-    $('#crawl-new-btn').addEventListener('click', () => {
-      $('#crawl-keyword').focus();
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    $('#crawl-new-btn').addEventListener('click', () => openCrawlCreateModal());
+
+    // 环境检查：页头按钮是展开入口；展开后段内按钮可收起
+    const diagToggle = $('#crawl-diag-toggle');
+    if (diagToggle) diagToggle.addEventListener('click', () => {
+      crawlState.diag.expanded = !crawlState.diag.expanded;
+      renderDiag();
+    });
+    const diagOpen = $('#crawl-diag-open');
+    if (diagOpen) diagOpen.addEventListener('click', () => {
+      crawlState.diag.expanded = !crawlState.diag.expanded;
+      renderDiag();
+      const box = $('#crawl-diag');
+      if (crawlState.diag.expanded && box) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     });
 
-    $('#crawl-create-btn').addEventListener('click', async () => {
-      const payload = {
-        name: $('#crawl-name').value.trim(),
-        keyword: $('#crawl-keyword').value.trim(),
-        competitor_account: $('#crawl-competitor').value.trim(),
-        video_url: $('#crawl-video').value.trim(),
-        source: $('#crawl-source').value,
-        intent_keywords: $('#crawl-intent').value.trim(),
-        max_comments: parseInt($('#crawl-max').value, 10) || 100,
-        crawl_type: 'comment',
-      };
-      if (!payload.keyword && !payload.competitor_account && !payload.video_url) {
-        toast('至少填写一项：关键词 / 对标账号 / 视频URL', 'warn');
-        return;
-      }
-      try {
-        await window.CrawlAPI.createTask(payload);
-        toast('采集任务已创建');
-        $('#crawl-name').value = '';
-        $('#crawl-keyword').value = '';
-        $('#crawl-competitor').value = '';
-        $('#crawl-video').value = '';
-        $('#crawl-intent').value = '';
-        await loadCrawlTasks();
-      } catch (e) {
-        toast('创建失败：' + e.message, 'warn');
-      }
-    });
-
-    // 登录态横幅：未登录抖音时显示「去扫码登录」入口
-    const goLoginBtn = $('#crawl-go-login');
-    if (goLoginBtn) goLoginBtn.addEventListener('click', () => { location.hash = '#/accounts?tab=wizard&step=login'; });
-
-    /** 根据就绪检测刷新登录横幅显隐 */
-    async function refreshLoginBanner() {
-      const banner = $('#crawl-login-banner');
-      if (!banner) return;
-      let ok = true;
-      try {
-        const rd = await API.getReadiness();
-        const dl = (rd.items || []).find((i) => i.key === 'douyin_login');
-        ok = !dl || dl.ok !== false;
-      } catch (e) { ok = true; }
-      banner.style.display = ok ? 'none' : 'flex';
-    }
-
+    syncCrawlToolbar();
+    bindCrawlToolbar();
     await loadCrawlTasks();
-    refreshLoginBanner();
+    loadDiag();
 
-    // 检测谁回复了我：从已有评论任务的视频URL取范围 → 建 reply_check 任务 → 启动
+    // 检测谁回复了我：一键从「我发过评论的视频」批量建检测任务
     const crawlReplyBtn = $('#crawl-reply-btn');
-    const crawlReplyState = $('#crawl-reply-state');
-    if (crawlReplyBtn) {
-      crawlReplyBtn.addEventListener('click', async () => {
-        if (crawlReplyBtn.disabled) return;
-        let videos = [];
-        try {
-          const tasks = await API.getCommentTasks();
-          const arr = Array.isArray(tasks) ? tasks : ((tasks && tasks.items) || []);
-          const set = new Set();
-          arr.forEach((t) => {
-            const u = (t.videoUrl || t.video_url || '').trim();
-            if (u && /video\//.test(u)) set.add(u);
-          });
-          videos = [...set];
-        } catch (e) { /* 取失败则用空 */ }
-        if (!videos.length) {
-          toast('还没有带视频链接的评论任务，无法自动检测（先去评论回复发过评论）', 'warn');
-          return;
-        }
-        videos = videos.slice(0, 10);
-        crawlReplyBtn.disabled = true;
-        if (crawlReplyState) crawlReplyState.textContent = `正在创建 ${videos.length} 个检测任务…`;
-        let created = 0, started = 0;
-        try {
-          for (const v of videos) {
-            const task = await window.CrawlAPI.createTask({
-              name: '检测回复 · ' + v.slice(-14),
-              crawl_type: 'reply_check',
-              video_url: v,
-              source: 'own_comment',
-              max_comments: 200,
-            });
-            created++;
-            try { await window.CrawlAPI.startTask(task.id); started++; } catch (e) { /* 启动失败等登录 */ }
-          }
-          toast(`已创建 ${created} 个检测任务（已启动 ${started} 个），结果回到「待办互动 → 评论回复」`);
-        } catch (e) {
-          toast('检测任务创建失败：' + e.message, 'warn');
-        } finally {
-          crawlReplyBtn.disabled = false;
-          if (crawlReplyState) crawlReplyState.textContent = '';
-        }
-      });
-    }
+    if (crawlReplyBtn) crawlReplyBtn.addEventListener('click', () => runReplyCheck(crawlReplyBtn));
 
     // 运行中任务自动刷新状态
     crawlState.polling = setInterval(async () => {
@@ -6562,115 +9335,490 @@
           } catch (e) { /* ignore */ }
         }
         renderCrawlTaskList();
+        if (crawlState.modalId) refreshCrawlTaskModal();
       }
     }, 5000);
+  }
+
+  /* ────────── 弹窗一：新建采集任务 ────────── */
+  function openCrawlCreateModal() {
+    openModal(`
+      <h2 id="modal-title">新建采集任务</h2>
+      <p class="modal__lede">至少填写一项采集入口。采集结果会按高意向关键词打分后，自动入库为线索。</p>
+
+      <div class="field">
+        <label for="crawl-name">任务名称 <span class="field__hint">可选</span></label>
+        <input type="text" id="crawl-name" placeholder="留空自动生成，如：关键词:装修">
+      </div>
+
+      <div class="form-sec">
+        <div class="form-sec__title">采集入口 <span class="tag">三项至少填一项</span></div>
+        <div class="field">
+          <label for="crawl-keyword">搜索关键词</label>
+          <input type="text" id="crawl-keyword" placeholder="例：装修 报价">
+        </div>
+        <div class="field">
+          <label for="crawl-competitor">对标账号</label>
+          <input type="text" id="crawl-competitor" placeholder="抖音昵称或主页 URL">
+        </div>
+        <div class="field">
+          <label for="crawl-video">指定视频 URL</label>
+          <input type="text" id="crawl-video" placeholder="https://www.douyin.com/video/...">
+        </div>
+      </div>
+
+      <div class="form-sec">
+        <div class="form-sec__title">筛选与上限 <span class="tag">可选</span></div>
+        <div class="field__row">
+          <div class="field">
+            <label for="crawl-source">来源归因</label>
+            <select id="crawl-source">
+              <option value="own_comment">自有视频评论区</option>
+              <option value="competitor">对标账号监控</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="crawl-max">最大采集条数</label>
+            <input type="number" id="crawl-max" value="100" min="1" max="10000">
+          </div>
+        </div>
+        <div class="field">
+          <label for="crawl-intent">高意向关键词 <span class="field__hint">逗号分隔，命中加权评分</span></label>
+          <input type="text" id="crawl-intent" placeholder="多少钱,报价,加微信,怎么合作">
+        </div>
+      </div>
+
+      <div class="modal__foot">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="button" class="btn btn--primary" id="crawl-create-btn">创建任务</button>
+      </div>
+    `);
+
+    requestAnimationFrame(() => { const el = $('#crawl-keyword'); if (el) el.focus(); });
+
+    const createBtn = $('#crawl-create-btn');
+    createBtn.addEventListener('click', async () => {
+      const payload = {
+        name: $('#crawl-name').value.trim(),
+        keyword: $('#crawl-keyword').value.trim(),
+        competitor_account: $('#crawl-competitor').value.trim(),
+        video_url: $('#crawl-video').value.trim(),
+        source: $('#crawl-source').value,
+        intent_keywords: $('#crawl-intent').value.trim(),
+        max_comments: parseInt($('#crawl-max').value, 10) || 100,
+        crawl_type: 'comment',
+      };
+      if (!payload.keyword && !payload.competitor_account && !payload.video_url) {
+        toast('至少填写一项：关键词 / 对标账号 / 视频 URL', 'warn');
+        return;
+      }
+      createBtn.disabled = true;
+      try {
+        const task = await window.CrawlAPI.createTask(payload);
+        toast('采集任务已创建，可直接启动采集');
+        await loadCrawlTasks();
+        // 同一个弹窗直接切换成这个任务的采集视图（不关闭再打开，避免闪一下）
+        if (task && task.id) openCrawlTaskModal(task.id);
+        else closeModal();
+      } catch (e) {
+        toast('创建失败：' + e.message, 'warn');
+      } finally {
+        createBtn.disabled = false;
+      }
+    });
+  }
+
+  /* ────────── 弹窗二：任务详情（创建后点开就是它自己的采集视图） ────────── */
+  function crawlFindTask(id) {
+    return (crawlState.tasks || []).find((x) => String(x.id) === String(id)) || null;
+  }
+
+  function openCrawlTaskModal(taskId) {
+    const t = crawlFindTask(taskId);
+    if (!t) { toast('任务不存在或已删除', 'warn'); return; }
+    crawlState.modalId = t.id;
+    openModal(crawlTaskModalHtml(t));
+    bindCrawlTaskModal();
+  }
+
+  function refreshCrawlTaskModal() {
+    const modal = $('#modal');
+    if (!modal || modal.hidden) return;
+    const t = crawlFindTask(crawlState.modalId);
+    if (!t) { crawlState.modalId = null; closeModal(); return; }
+    modal.innerHTML = crawlTaskModalHtml(t);
+    $$('[data-close]', modal).forEach((b) => b.addEventListener('click', closeModal));
+    bindCrawlTaskModal();
+  }
+
+  function crawlTaskModalHtml(t) {
+    const sm = CRAWL_STATUS[t.status] || CRAWL_STATUS.pending;
+    const isReply = t.crawl_type === 'reply_check';
+    const target = t.max_comments || 0;
+    const collected = t.collected_count || 0;
+    const imported = t.imported_count || 0;
+    const rate = collected ? Math.round((imported / collected) * 100) : 0;
+    const pct = target ? Math.min(100, Math.round((collected / target) * 100)) : 0;
+
+    const entries = [];
+    if (t.keyword) entries.push(['搜索关键词', t.keyword]);
+    if (t.competitor_account) entries.push(['对标账号', t.competitor_account]);
+    if (t.video_url) entries.push(['指定视频', t.video_url]);
+    if (t.account) entries.push(['指定账号', t.account]);
+    if (!entries.length) entries.push(['采集入口', '评论采集']);
+
+    return `
+      <h2 id="modal-title">${esc(t.name || '未命名任务')}</h2>
+      <div class="crawl-modal__badges">
+        <span class="ctask__dot ctask__dot--${esc(t.status)}"></span>
+        <span class="ctask__type">${isReply ? '回复检测' : '评论采集'}</span>
+        <span class="status-pill ${sm.cls}">${sm.label}</span>
+        <span class="crawl-modal__spacer"></span>
+        <span class="crawl-modal__time">${esc(crawlRelTime(t.created_at))}</span>
+      </div>
+
+      <div class="crawl-modal__progress">
+        <div class="crawl-modal__progress-top">
+          <span>已采集 <b>${collected.toLocaleString('zh-CN')}</b>${target ? ` / 目标 ${target.toLocaleString('zh-CN')}` : ''}</span>
+          <span class="crawl-modal__rate">入库 ${imported.toLocaleString('zh-CN')}${collected ? ` · 入库率 ${rate}%` : ''}</span>
+        </div>
+        <div class="progress-bar"><div class="progress-bar__fill" style="width:${pct}%"></div></div>
+      </div>
+
+      <dl class="crawl-modal__kv">
+        ${entries.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join('')}
+        <dt>来源归因</dt><dd>${t.source === 'competitor' ? '对标账号监控' : '自有视频评论区'}</dd>
+        <dt>创建时间</dt><dd>${esc(crawlDateTime(t.created_at))}</dd>
+      </dl>
+
+      <p class="crawl-modal__tip">${isReply
+        ? '命中结果回到「待办互动 → 评论回复 → 已回复追踪」，可直接继续回复。'
+        : '采集结果按意向分入库，去「线索」页即可筛选跟进。'}</p>
+
+      <div class="modal__foot modal__foot--split">
+        <button type="button" class="btn btn--ghost" data-crawl="delete">删除任务</button>
+        <span class="crawl-modal__spacer"></span>
+        <button type="button" class="btn" data-close>关闭</button>
+        ${t.status === 'running' ? '<button type="button" class="btn" data-crawl="stop">停止采集</button>' : ''}
+        ${(t.status === 'pending' || t.status === 'failed')
+          ? `<button type="button" class="btn btn--primary" data-crawl="start">${t.status === 'failed' ? '重新采集' : '启动采集'}</button>` : ''}
+        ${t.status === 'completed'
+          ? `<a class="btn btn--primary" data-close href="${isReply ? '#/interact' : '#/leads'}">${isReply ? '查看回复' : '查看线索'}</a>` : ''}
+      </div>`;
+  }
+
+  function bindCrawlTaskModal() {
+    const modal = $('#modal');
+    $$('[data-crawl]', modal).forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const t = crawlFindTask(crawlState.modalId);
+        if (!t) { crawlState.modalId = null; closeModal(); return; }
+        const action = btn.dataset.crawl;
+        btn.disabled = true;
+        try {
+          if (action === 'start') {
+            if (!(await ensureDouyinLogin())) { btn.disabled = false; return; }
+            try {
+              await window.CrawlAPI.startTask(t.id);
+              toast('采集已启动');
+              crawlState.diag.lastError = '';
+              renderDiag();
+            } catch (err) {
+              // 失败原因不弹大段文案，收进页面的环境检查清单
+              crawlState.modalId = null;
+              closeModal();
+              diagFail(err.message);
+              btn.disabled = false;
+              return;
+            }
+          } else if (action === 'stop') {
+            await window.CrawlAPI.stopTask(t.id);
+            toast('采集已停止');
+          } else if (action === 'delete') {
+            if (!window.confirm(`删除任务「${t.name || '未命名任务'}」？已入库的线索不受影响。`)) {
+              btn.disabled = false;
+              return;
+            }
+            await window.CrawlAPI.deleteTask(t.id);
+            toast('任务已删除');
+            crawlState.modalId = null;
+            closeModal();
+            await loadCrawlTasks();
+            return;
+          }
+          await loadCrawlTasks();
+          if (crawlState.modalId) refreshCrawlTaskModal();
+          else btn.disabled = false;
+        } catch (err) {
+          toast('操作失败：' + err.message, 'warn');
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  /* ────────── 一键检测谁回复了我 ────────── */
+  async function runReplyCheck(btn) {
+    let videos = [];
+    try {
+      const tasks = await API.getCommentTasks();
+      const arr = Array.isArray(tasks) ? tasks : ((tasks && tasks.items) || []);
+      const seen = new Set();
+      arr.forEach((t) => {
+        const u = (t.videoUrl || t.video_url || '').trim();
+        if (u && /video\//.test(u)) seen.add(u);
+      });
+      videos = [...seen];
+    } catch (e) { /* 取失败按空处理 */ }
+
+    if (!videos.length) {
+      toast('还没有带视频链接的评论任务，先去「待办互动」发过评论再检测', 'warn');
+      return;
+    }
+
+    // 已建过检测任务的视频不重复创建
+    const existed = new Set((crawlState.tasks || [])
+      .filter((t) => t.crawl_type === 'reply_check' && t.video_url)
+      .map((t) => String(t.video_url).trim()));
+    const pending = videos.filter((v) => !existed.has(v)).slice(0, 10);
+
+    if (!pending.length) {
+      toast('这些视频都已建过检测任务，无需重复创建');
+      return;
+    }
+
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = '检测中…';
+    let created = 0, started = 0;
+    try {
+      for (const v of pending) {
+        const task = await window.CrawlAPI.createTask({
+          name: '检测回复 · ' + v.slice(-14),
+          crawl_type: 'reply_check',
+          video_url: v,
+          source: 'own_comment',
+          max_comments: 200,
+        });
+        created++;
+        try { await window.CrawlAPI.startTask(task.id); started++; } catch (e) { /* 未登录等留待手工启动 */ }
+      }
+      toast(`已创建 ${created} 个检测任务（启动 ${started} 个），结果回到「待办互动 → 评论回复」`);
+      await loadCrawlTasks();
+    } catch (e) {
+      toast('检测任务创建失败：' + e.message, 'warn');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
   }
 
   async function loadCrawlTasks() {
     try {
       crawlState.tasks = await window.CrawlAPI.listTasks();
-      const hint = $('#crawl-list-hint');
-      if (hint) hint.textContent = `共 ${crawlState.tasks.length} 个任务`;
       renderCrawlTaskList();
     } catch (e) {
-      const hint = $('#crawl-list-hint');
+      crawlState.tasks = [];
       const list = $('#crawl-task-list');
-      if (hint) hint.textContent = '加载失败';
       if (list) list.innerHTML = emptyState('i-alert', '无法连接后端 API：' + e.message);
+      renderCrawlKpi([]);
     }
+  }
+
+  /** 相对时间：3 分钟前 / 昨天 14:20 / 09-12 */
+  function crawlRelTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const diff = (Date.now() - d.getTime()) / 1000;
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+    if (diff < 172800) return `昨天 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /** 顶部概览：总数 / 采集中 / 已入库线索 / 失败 */
+  function renderCrawlKpi(all) {
+    const box = $('#crawl-kpi');
+    if (!box) return;
+    const running = all.filter((t) => t.status === 'running').length;
+    const failed = all.filter((t) => t.status === 'failed').length;
+    const imported = all.reduce((s, t) => s + (t.imported_count || 0), 0);
+    box.innerHTML = `
+      <div class="crawl-kpi__item">
+        <div class="crawl-kpi__label">总任务</div>
+        <div class="crawl-kpi__value">${all.length}</div>
+      </div>
+      <div class="crawl-kpi__item">
+        <div class="crawl-kpi__label">采集中</div>
+        <div class="crawl-kpi__value ${running ? 'crawl-kpi__value--ok' : ''}">${running}</div>
+        <div class="crawl-kpi__foot">${running ? '实时刷新中' : '当前无运行任务'}</div>
+      </div>
+      <div class="crawl-kpi__item">
+        <div class="crawl-kpi__label">已入库线索</div>
+        <div class="crawl-kpi__value">${imported.toLocaleString('zh-CN')}</div>
+      </div>
+      <div class="crawl-kpi__item">
+        <div class="crawl-kpi__label">失败</div>
+        <div class="crawl-kpi__value ${failed ? 'crawl-kpi__value--bad' : ''}">${failed}</div>
+        <div class="crawl-kpi__foot">${failed ? '可重新采集' : '无异常'}</div>
+      </div>`;
   }
 
   function renderCrawlTaskList() {
     const list = $('#crawl-task-list');
     if (!list) return;
-    if (!crawlState.tasks.length) {
-      list.innerHTML = emptyState('i-empty', '暂无采集任务');
+    const all = crawlState.tasks || [];
+    const f = crawlState.filter;
+
+    renderCrawlKpi(all);
+
+    // 状态筛选按钮：计数 + 选中态
+    const counts = { all: all.length, running: 0, pending: 0, completed: 0, failed: 0 };
+    all.forEach((t) => { if (counts[t.status] !== undefined) counts[t.status] += 1; });
+    $$('.crawl-toolbar [data-status]').forEach((btn) => {
+      const k = btn.dataset.status;
+      const c = btn.querySelector('.count');
+      if (c) c.textContent = counts[k] || 0;
+      btn.setAttribute('aria-pressed', String(f.status === k));
+    });
+
+    // 筛选：状态 → 类型 → 关键词
+    let rows = all.slice();
+    if (f.status !== 'all') rows = rows.filter((t) => t.status === f.status);
+    if (f.type !== 'all') rows = rows.filter((t) => (t.crawl_type || 'comment') === f.type);
+    const q = (f.q || '').trim().toLowerCase();
+    if (q) {
+      rows = rows.filter((t) => [t.name, t.keyword, t.competitor_account, t.video_url, t.account]
+        .some((v) => String(v || '').toLowerCase().includes(q)));
+    }
+
+    // 排序
+    if (f.sort === 'progress') {
+      rows.sort((a, b) => (b.collected_count || 0) / (b.max_comments || 1) - (a.collected_count || 0) / (a.max_comments || 1));
+    } else if (f.sort === 'collected') {
+      rows.sort((a, b) => (b.collected_count || 0) - (a.collected_count || 0));
+    } else {
+      rows.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    }
+
+    const filtered = rows.length !== all.length;
+    const head = $('#crawl-count');
+    if (head) {
+      head.innerHTML = all.length
+        ? `任务 <b>${rows.length}</b> / ${all.length}${filtered ? '<span class="crawl-toolbar__flag">已筛选</span>' : ''}`
+        : '';
+    }
+
+    if (!all.length) {
+      list.innerHTML = `<div class="empty">
+        <div class="empty__ico">${ico('i-rocket')}</div>
+        <p>还没有采集任务。点「新建采集任务」填关键词 / 对标账号 / 视频 URL，即可开始采集。</p>
+        <button type="button" class="btn btn--primary btn--sm" id="crawl-empty-new" style="margin-top:10px">${ico('i-rocket')} 新建采集任务</button>
+      </div>`;
+      const en = $('#crawl-empty-new');
+      if (en) en.addEventListener('click', () => openCrawlCreateModal());
       return;
     }
-    const statusMeta = {
-      pending: { label: '待启动', cls: 'status-pill--muted' },
-      running: { label: '采集中', cls: 'status-pill--running' },
-      completed: { label: '已完成', cls: 'status-pill--ok' },
-      failed: { label: '失败', cls: 'status-pill--danger' },
-    };
-    list.innerHTML = crawlState.tasks.map((t) => {
-      const sm = statusMeta[t.status] || statusMeta.pending;
-      const progress = t.max_comments ? Math.min(100, Math.round((t.collected_count / t.max_comments) * 100)) : 0;
-      const entryParts = [];
-      if (t.keyword) entryParts.push(`关键词:${esc(t.keyword)}`);
-      if (t.competitor_account) entryParts.push(`对标:${esc(t.competitor_account)}`);
-      if (t.video_url) entryParts.push('指定视频');
-      return `<div class="task-item task-item--collapsible" data-id="${esc(t.id)}">
-        <div class="task-item__header" data-toggle="collapse">
-          <span class="task-item__arrow">▶</span>
-          <span class="task-item__title">${esc(t.name || '未命名任务')}</span>
-          <span class="task-item__summary">${entryParts.join(' · ') || '评论采集'} · ${t.collected_count}/${t.imported_count}</span>
-          <span class="status-pill ${sm.cls}">${sm.label}</span>
-        </div>
-        <div class="task-item__body" hidden>
-          <div class="task-item__meta">
-            ${entryParts.join(' · ') || '评论采集'}
-            · 来源:${t.source === 'competitor' ? '对标监控' : '自有评论'}
-            · 已采集 <b>${t.collected_count}</b> / 已入库 <b>${t.imported_count}</b>
-          </div>
-          ${t.status === 'running' ? `
-          <div class="progress-bar"><div class="progress-bar__fill" style="width:${progress}%"></div></div>
-          <div class="task-item__meta">进度 ${progress}%</div>` : ''}
-          ${t.error_message ? `<div class="task-item__error">${esc(t.error_message)}</div>` : ''}
-          <div class="task-item__actions">
-            ${t.status === 'pending' || t.status === 'failed' ?
-              `<button type="button" class="btn btn--primary btn--sm" data-action="start">启动采集</button>` : ''}
-            ${t.status === 'running' ?
-              `<button type="button" class="btn btn--sm" data-action="stop">停止</button>` : ''}
-            <button type="button" class="btn btn--ghost btn--sm" data-action="delete">删除</button>
-          </div>
-        </div>
+    if (!rows.length) {
+      list.innerHTML = `<div class="empty">
+        <div class="empty__ico">${ico('i-empty')}</div>
+        <p>当前筛选条件下没有任务</p>
+        <button type="button" class="btn btn--sm" id="crawl-filter-reset" style="margin-top:8px">清空筛选</button>
       </div>`;
-    }).join('');
+      const rs = $('#crawl-filter-reset');
+      if (rs) rs.addEventListener('click', () => {
+        crawlState.filter = { q: '', status: 'all', type: 'all', sort: 'recent' };
+        syncCrawlToolbar();
+        renderCrawlTaskList();
+      });
+      return;
+    }
 
-    // 折叠/展开
-    $$('#crawl-task-list [data-toggle="collapse"]').forEach((header) => {
-      header.addEventListener('click', (e) => {
-        if (e.target.closest('[data-action]')) return;
-        const item = header.closest('.task-item');
-        const body = item.querySelector('.task-item__body');
-        const arrow = item.querySelector('.task-item__arrow');
-        body.hidden = !body.hidden;
-        arrow.textContent = body.hidden ? '▶' : '▼';
-        item.classList.toggle('task-item--expanded', !body.hidden);
+    list.innerHTML = `${rows.map((t) => {
+      const sm = CRAWL_STATUS[t.status] || CRAWL_STATUS.pending;
+      const target = t.max_comments || 0;
+      const collected = t.collected_count || 0;
+      const imported = t.imported_count || 0;
+      const progress = target ? Math.min(100, Math.round((collected / target) * 100)) : 0;
+      const rate = collected ? Math.round((imported / collected) * 100) : 0;
+      const entryParts = [];
+      if (t.keyword) entryParts.push(`关键词 ${esc(t.keyword)}`);
+      if (t.competitor_account) entryParts.push(`对标 ${esc(t.competitor_account)}`);
+      if (t.video_url) entryParts.push('指定视频');
+      const isReply = t.crawl_type === 'reply_check';
+      const when = crawlRelTime(t.created_at);
+      return `<article class="ctask ctask--${esc(t.status)}" data-id="${esc(t.id)}" tabindex="0" role="button" aria-label="查看任务详情：${esc(t.name || '未命名任务')}">
+        <div class="ctask__top">
+          <span class="ctask__dot ctask__dot--${esc(t.status)}"></span>
+          <h3 class="ctask__title" title="${esc(t.name || '未命名任务')}">${esc(t.name || '未命名任务')}</h3>
+          ${isReply ? '<span class="ctask__type">回复检测</span>' : ''}
+        </div>
+        <p class="ctask__meta">${entryParts.join(' · ') || '评论采集'} · 目标 ${target} 条</p>
+        <div class="ctask__stats">
+          <span>已采<b>${collected.toLocaleString('zh-CN')}</b></span>
+          <span>入库<b>${imported.toLocaleString('zh-CN')}</b></span>
+          <span>入库率<b>${collected ? rate + '%' : '—'}</b></span>
+        </div>
+        ${t.status === 'running' ? `<div class="progress-bar ctask__progress"><div class="progress-bar__fill" style="width:${progress}%"></div></div>` : ''}
+        <div class="ctask__foot">
+          <span class="status-pill ${sm.cls}">${sm.label}</span>
+          ${when ? `<span class="ctask__when">${esc(when)}</span>` : ''}
+          <span class="crawl-toolbar__spacer"></span>
+          ${t.status === 'pending' || t.status === 'failed' ?
+            `<button type="button" class="btn btn--primary btn--sm" data-action="start">${t.status === 'failed' ? '重新采集' : '启动采集'}</button>` : ''}
+          ${t.status === 'running' ?
+            `<button type="button" class="btn btn--sm" data-action="stop">停止</button>` : ''}
+          ${t.status === 'completed' ?
+            `<a class="btn btn--sm" href="${isReply ? '#/interact' : '#/leads'}">${isReply ? '查看回复' : '查看线索'}</a>` : ''}
+        </div>
+      </article>`;
+    }).join('')}`;
+
+    // 点卡片任意位置 = 打开详情弹窗
+    $$('#crawl-task-list .ctask').forEach((card) => {
+      const open = () => openCrawlTaskModal(card.dataset.id);
+      card.addEventListener('click', (e) => { if (!e.target.closest('button, a')) open(); });
+      card.addEventListener('keydown', (e) => {
+        if ((e.key === 'Enter' || e.key === ' ') && !e.target.closest('button, a')) { e.preventDefault(); open(); }
       });
     });
 
     $$('#crawl-task-list [data-action]').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
-        const item = e.target.closest('.task-item');
+        const item = e.target.closest('.ctask');
         const id = item.dataset.id;
         const action = e.target.dataset.action;
+        if (action === 'detail') { openCrawlTaskModal(id); return; }
+        btn.disabled = true;
         try {
           if (action === 'start') {
-            // 启动前先校验抖音登录态，未登录则提示并引导跳转登录页
-            if (!(await ensureDouyinLogin())) return;
+            // 启动前先看环境检查清单，未就绪就地展开，不打断操作
+            const ready = await ensureDouyinLogin();
+            if (!ready) return;
             try {
               await window.CrawlAPI.startTask(id);
               toast('采集已启动');
+              crawlState.diag.lastError = '';
+              renderDiag();
             } catch (err) {
-              if (/未登录|扫码登录|MediaCrawler/.test(err.message)) {
-                const go = window.confirm('启动失败：' + err.message + '\n是否前往「上线向导」扫码登录抖音？');
-                if (go) { location.hash = '#/accounts?tab=wizard&step=login'; }
-              } else {
-                throw err;
-              }
+              diagFail(err.message);   // 原因进清单，不弹窗
             }
           } else if (action === 'stop') {
             await window.CrawlAPI.stopTask(id);
             toast('采集已停止');
           } else if (action === 'delete') {
+            const t = crawlFindTask(id);
+            if (!window.confirm(`删除任务「${(t && t.name) || '未命名任务'}」？已入库的线索不受影响。`)) return;
             await window.CrawlAPI.deleteTask(id);
             toast('任务已删除');
           }
           await loadCrawlTasks();
         } catch (err) {
           toast('操作失败：' + err.message, 'warn');
+        } finally {
+          btn.disabled = false;
         }
       });
     });
@@ -6720,24 +9868,9 @@
       return;
     }
 
-    // 业务配置Tab（原「上手向导」的业务配置 5 步，2026-09-12 迁到这里）
+    // 业务配置已与话术库合到「话术与业务配置」页（2026-09-13），旧链接统一跳过去
     if (outerTab === 'business') {
-      main.innerHTML = `
-        <div class="view">
-          ${pageHead({ icon: 'i-gear', title: '系统', desc: '业务配置与数据管理' })}
-          <div class="tabs" id="outer-settings-tabs">
-            <button class="tab" data-tab="settings">系统设置</button>
-            <button class="tab tab--active" data-tab="business">业务配置</button>
-            <button class="tab" data-tab="backup">数据备份</button>
-          </div>
-          ${bizConfigSkeletonHtml()}
-        </div>`;
-      $('#outer-settings-tabs').addEventListener('click', (e) => {
-        const btn = e.target.closest('[data-tab]');
-        if (!btn) return;
-        location.hash = `#/settings?tab=${btn.dataset.tab}`;
-      });
-      await renderBizConfigBody();
+      location.hash = '#/scripts?tab=business';
       return;
     }
 
@@ -6745,10 +9878,9 @@
     if (outerTab === 'backup') {
       main.innerHTML = `
         <div class="view">
-          ${pageHead({ icon: 'i-gear', title: '系统', desc: '业务配置与数据管理' })}
+          ${pageHead({ icon: 'i-gear', title: '系统', desc: '系统设置与数据管理' })}
           <div class="tabs" id="outer-settings-tabs">
             <button class="tab" data-tab="settings">系统设置</button>
-            <button class="tab" data-tab="business">业务配置</button>
             <button class="tab tab--active" data-tab="backup">数据备份</button>
           </div>
           <div id="backup-mount"></div>
@@ -6780,7 +9912,6 @@
     }) + `
       <div class="tabs" id="outer-settings-tabs">
         <button class="tab tab--active" data-tab="settings">系统设置</button>
-        <button class="tab" data-tab="business">业务配置</button>
         <button class="tab" data-tab="backup">数据备份</button>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
@@ -6824,15 +9955,23 @@
             <select id="set-ai-provider" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--ink)">
               <option value="doubao" ${ai.provider === 'doubao' ? 'selected' : ''}>豆包 (Doubao / Volcengine Ark)</option>
               <option value="dashscope" ${ai.provider === 'dashscope' ? 'selected' : ''}>通义千问 (DashScope)</option>
+              <option value="openai" ${ai.provider === 'openai' ? 'selected' : ''}>OpenAI 兼容 (sailapi 等任意网关)</option>
             </select>
+          </div>
+          <div class="field" id="set-ai-baseurl-field" style="margin-bottom:16px;${ai.provider === 'openai' ? '' : 'display:none'}">
+            <label for="set-ai-baseurl">API Base URL（OpenAI 兼容，需含 /v1）</label>
+            <input type="text" id="set-ai-baseurl" value="${esc(ai.base_url || '')}" placeholder="https://sub.sailapi.top/v1" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--ink)">
+            <p style="font-size:12px;color:var(--ink-soft);margin:6px 0 0">OpenAI 兼容基地址，例如 https://sub.sailapi.top/v1（后面可一键拉取该网关上的全部模型）</p>
           </div>
           <div class="field" style="margin-bottom:16px">
             <label for="set-ai-key">API Key</label>
             <input type="password" id="set-ai-key" value="${esc(ai.api_key || '')}" placeholder="sk-..." style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--ink)">
           </div>
           <div class="field" style="margin-bottom:16px">
-            <label for="set-ai-model">模型名称 / Endpoint ID</label>
-            <input type="text" id="set-ai-model" value="${esc(ai.model || '')}" placeholder="如 ep-20240101-default 或 qwen-plus" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--ink)">
+            <label for="set-ai-model">模型名称 / Model ID</label>
+            <input type="text" id="set-ai-model" list="set-ai-model-list" value="${esc(ai.model || '')}" placeholder="如 gpt-4o / 从网关拉取" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--ink)">
+            <datalist id="set-ai-model-list"></datalist>
+            <button type="button" class="btn" id="set-ai-fetch-models" style="margin-top:8px;${ai.provider === 'openai' ? 'display:inline-block' : 'display:none'}">从网关拉取模型列表</button>
           </div>
           <div class="field" style="margin-bottom:16px">
             <label for="set-ai-temp">温度 (Temperature)：<span id="set-ai-temp-val">${ai.temperature ?? 0.7}</span></label>
@@ -6852,12 +9991,40 @@
         $('#set-ai-temp').addEventListener('input', (e) => {
           $('#set-ai-temp-val').textContent = e.target.value;
         });
+        // Provider 切换：openai 时显示基地址与拉取模型按钮
+        $('#set-ai-provider').addEventListener('change', (e) => {
+          const isOpenAI = e.target.value === 'openai';
+          $('#set-ai-baseurl-field').style.display = isOpenAI ? '' : 'none';
+          $('#set-ai-fetch-models').style.display = isOpenAI ? 'inline-block' : 'none';
+        });
+        // 从网关拉取模型列表（仅 openai）
+        $('#set-ai-fetch-models').addEventListener('click', async () => {
+          const btn = $('#set-ai-fetch-models');
+          btn.disabled = true;
+          btn.textContent = '拉取中...';
+          try {
+            const data = await SettingsAPI.fetchAIModels();
+            const models = (data.models || []);
+            const dl = $('#set-ai-model-list');
+            dl.innerHTML = models.map(m => `<option value="${esc(m)}"></option>`).join('');
+            if (!($('#set-ai-model').value).trim() && models.length) {
+              $('#set-ai-model').value = models[0];
+            }
+            toast(`已拉取 ${models.length} 个可用模型，可在模型输入框下拉选择`);
+          } catch (e) {
+            toast('拉取模型失败：' + e.message, 'warn');
+          } finally {
+            btn.disabled = false;
+            btn.textContent = '从网关拉取模型列表';
+          }
+        });
         // 保存
         $('#set-ai-save').addEventListener('click', async () => {
           const payload = {
             provider: $('#set-ai-provider').value,
             api_key: $('#set-ai-key').value,
             model: $('#set-ai-model').value,
+            base_url: $('#set-ai-baseurl').value,
             temperature: parseFloat($('#set-ai-temp').value),
             timeout: parseInt($('#set-ai-timeout').value, 10),
           };
@@ -6879,6 +10046,7 @@
               provider: $('#set-ai-provider').value,
               api_key: $('#set-ai-key').value,
               model: $('#set-ai-model').value,
+              base_url: $('#set-ai-baseurl').value,
               timeout: parseInt($('#set-ai-timeout').value, 10) || 10,
             });
             if (result.success) {
@@ -6946,7 +10114,7 @@
         `;
         container.innerHTML = `
           ${ruleRow('r1', 'R1 · 单账号日频限流', c.r1_threshold ?? 80, c.r1_enabled ?? true, '单账号日发送量 ≥ 阈值时，自动降速至 40 条/天')}
-          ${ruleRow('r2', 'R2 · 话术变体自动切换', c.r2_threshold ?? 8, c.r2_enabled ?? true, '话术变体加微转化率 < 阈值（样本≥30）时，自动切换到更优变体')}
+          ${ruleRow('r2', 'R2 · 话术变体自动切换', c.r2_threshold ?? 8, c.r2_enabled ?? true, '变体按权重随机分配（转化率未回写，R2 自动切换暂不触发）')}
           ${ruleRow('r3', 'R3 · 黑名单激增安全模式', c.r3_threshold ?? 3, c.r3_enabled ?? true, '黑名单日增 > 阈值（%）或账号封禁时，触发全量暂停安全模式')}
           <div style="margin-top:20px">
             <button type="button" class="btn btn--primary" id="set-c-save">保存合规规则</button>
@@ -7532,6 +10700,19 @@
     if (h !== 'interact' && h !== 'dm' && window._dmBatchTimer) { clearInterval(window._dmBatchTimer); window._dmBatchTimer = null; }
   });
 
+
+  /* 补充样式表：变量筛选器 + AI 话术优化面板。
+     ⚠️ 本应并入 assets/css/style.css，但该文件当前被主机写入保护挡住
+        （C 盘 0 字节 → 改动备份写不进去 → 写入 fail-closed），只能落到独立 css 再动态挂载。
+        磁盘恢复后：把 style-ai.css 内容并进 style.css，删掉这段挂载代码即可。 */
+  (function mountExtraStyle() {
+    if (document.getElementById('style-ai')) return;
+    const link = document.createElement('link');
+    link.id = 'style-ai';
+    link.rel = 'stylesheet';
+    link.href = 'assets/css/style-ai.css';
+    document.head.appendChild(link);
+  })();
 
   /* ══════════ 启动 ══════════ */
   (async function init() {

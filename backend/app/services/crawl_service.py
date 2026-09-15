@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from app.integrations.mediacrawler_client import MediaCrawlerClient, MediaCrawlerUnavailable
@@ -43,8 +44,11 @@ NOISE_PHRASES = ["哈哈", "666", "沙发", "顶", "路过", "不错", "可以"]
 NOISE_EMOJIS = ["👍", "🔥", "😂", "👏", "💪", "😀", "😁", "🤣"]
 
 # 三级分流阈值
-HIGH_SCORE_THRESHOLD = 60
-MID_SCORE_THRESHOLD = 30
+# MID=20：真实求购评论往往很短（"求装修流程图" 仅 6 字），阈值定 30 会把
+# 这类明确意向全部丢掉；命中高意向词才可能到 20，噪音（纯表情/灌水）已被
+# _is_noise 与关键词命中前置拦截。
+HIGH_SCORE_THRESHOLD = 55
+MID_SCORE_THRESHOLD = 20
 
 
 class CrawlService:
@@ -141,6 +145,20 @@ class CrawlService:
             return task
 
         state = str(resp.get("status") or resp.get("state") or "").lower()
+        if state in ("running", "pending", "starting"):
+            # 实时进度：统计本次任务已落盘的评论条数。
+            # 大任务（20 视频 × 50 评论）要跑好几分钟，没有它界面会一直显示 0，看起来像卡死。
+            try:
+                collected = sum(
+                    len(self._read_records(p)) for p in self._fresh_comment_files(task)
+                )
+                if collected and collected != task.collected_count:
+                    task.collected_count = collected
+                    task.updated_at = now_utc()
+                    self._repo.save_crawl_task(task)
+            except Exception:
+                pass
+            return task
         if state in ("completed", "success", "done", "finished", "idle"):
             task.status = "completed"
             task.finished_at = now_utc()
@@ -148,6 +166,9 @@ class CrawlService:
             self._repo.save_crawl_task(task)
             # 采集完成后自动读取结果文件并导入
             self._auto_import_results(task)
+            # 导入会更新采集/入库计数（写入的是另一个 task 实例），
+            # 这里必须重新读取，否则本次响应仍返回 0，界面看起来像"采集失败"。
+            task = self._repo.get_crawl_task(task_id)
         elif state in ("failed", "error"):
             task.status = "failed"
             task.error_message = str(
@@ -177,14 +198,28 @@ class CrawlService:
             except KeyError:
                 task = None
 
-        intent_keywords = self._parse_keywords(
-            task.intent_keywords if task else payload.keyword
-        )
+        # 意向词回退链：任务自定义 → 客户画像（业务配置）→ 任务搜索词。
+        # 三者都为空时评分恒为低分，会导致"采到了却一条都不入库"。
+        raw_intent = (task.intent_keywords if task else "") or ""
+        if not raw_intent:
+            raw_intent = self._audience_intent_keywords()
+        if not raw_intent and task is not None:
+            raw_intent = task.keyword or ""
+        intent_keywords = self._parse_keywords(raw_intent)
         excluded_keywords = self._parse_keywords(
             task.excluded_keywords if task else ""
         )
         seen_comment_ids: set[str] = set()
         video_filter_cache: dict[str, bool] = {}   # aweme_id → 是否通过视频级筛选
+        # v009：视频标题映射（aweme_id → 标题）。MediaCrawler 的评论文件不带标题，
+        # 标题在同批的内容文件里；缺了它，线索池与待办互动的「视频名称」一栏全空。
+        title_map = self._video_title_map() if any(
+            not (i.video_title or "").strip() for i in payload.items
+        ) else {}
+        if title_map:
+            for _it in payload.items:
+                if not (_it.video_title or "").strip() and _it.aweme_id:
+                    _it.video_title = title_map.get(str(_it.aweme_id).strip(), "")
         # v008：全量评论建树（一级 + 所有子评论，每条带 comment_id/parent_comment_id）
         # 用于多级回复检测：以 comment_task.comment_id 为根展开全部后代（限 6 级）。
         all_nodes: dict[str, CrawlImportItem] = {}   # comment_id -> item
@@ -269,6 +304,7 @@ class CrawlService:
                 video=item.video_title,
                 source_url=source_url,
                 source_keyword=payload.keyword or (task.keyword if task else ""),
+                source_task_id=task_id or "",
                 platform="douyin",
                 external_id=external_id,
                 tags=tags,
@@ -442,6 +478,7 @@ class CrawlService:
             video=payload.video,
             source_url=payload.source_url,
             source_keyword=payload.source_keyword,
+            source_task_id=payload.source_task_id,
             platform=payload.platform,
             external_id=payload.external_id,
             tags=payload.tags,
@@ -528,11 +565,13 @@ class CrawlService:
         score = 0
         text = f"{content} {nickname}".lower()
         high_hits = sum(1 for kw in HIGH_INTENT_KEYWORDS if kw in text)
-        score += min(high_hits * 15, 45)
+        score += min(high_hits * 20, 40)
         biz_hits = sum(1 for kw in BUSINESS_KEYWORDS if kw in text)
         score += min(biz_hits * 10, 30)
         custom_hits = sum(1 for kw in intent_keywords if kw and kw in text)
         score += min(custom_hits * 12, 25)
+        if len(content) > 12:
+            score += 5
         if len(content) > 20:
             score += 5
         if len(content) > 50:
@@ -578,6 +617,22 @@ class CrawlService:
         except ValueError:
             return None
 
+    def _audience_intent_keywords(self) -> str:
+        """客户画像里配置的意向关键词（业务级兜底）。拿不到就返回空串。"""
+        try:
+            profile = self._repo.get_audience_profile()
+        except Exception:
+            return ""
+        raw = str(getattr(profile, "intent_keywords", "") or "")
+        if raw:
+            return raw
+        # 画像里的 needs / pain_points 也能当意向信号
+        parts = [
+            str(getattr(profile, "needs", "") or ""),
+            str(getattr(profile, "pain_points", "") or ""),
+        ]
+        return ",".join(p.strip() for p in parts if p.strip())
+
     def _parse_keywords(self, raw: str) -> list[str]:
         if not raw:
             return []
@@ -599,8 +654,34 @@ class CrawlService:
     # 任务 C：MediaCrawler API 对接（替代 subprocess）
     # ═══════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _normalize_keywords(raw: str) -> str:
+        """把「工作流 智能体」「工作流、智能体」统一成 MediaCrawler 认的逗号分隔形式。
+
+        MediaCrawler 只用英文逗号切分关键词，空格/顿号不会被识别，
+        会导致"工作流 智能体"被当成一整个短语去搜，结果极少甚至为空。
+        """
+        parts = [p.strip() for p in re.split(r"[,，、\s]+", raw or "") if p.strip()]
+        return ",".join(parts)
+
     def _launch_mediacrawler(self, task: CrawlTask) -> None:
         """调用已运行的 MediaCrawler API 启动采集（不再 spawn 子进程）。"""
+        # 先判断采集服务是否正忙：忙时启动会被拒，需要给用户准确提示而不是"未启动"
+        try:
+            current = MediaCrawlerClient().status()
+            if str(current.get("status") or "").lower() in ("running", "pending", "starting"):
+                task.status = "failed"
+                task.error_message = (
+                    "已有采集任务正在执行，请等它结束后再启动；"
+                    "或在采集任务列表里先停止当前任务。"
+                )
+                task.updated_at = now_utc()
+                self._repo.save_crawl_task(task)
+                return
+        except MediaCrawlerUnavailable:
+            pass  # 服务不可达，交给下面的 start 统一报错
+        except Exception:
+            pass
         try:
             # search/comment/profile → search 模式；competitor → creator 模式
             crawler_type = "creator" if task.crawl_type == "competitor" else "search"
@@ -619,7 +700,7 @@ class CrawlService:
             if task.crawl_type == "competitor" and task.competitor_account:
                 payload["creator_ids"] = task.competitor_account
             elif task.keyword:
-                payload["keywords"] = task.keyword
+                payload["keywords"] = self._normalize_keywords(task.keyword)
             elif task.video_url:
                 payload["keywords"] = task.video_url
 
@@ -653,29 +734,46 @@ class CrawlService:
     # 采集完成后自动导入结果文件
     # ═══════════════════════════════════════════════════════════
 
+    def _fresh_comment_files(self, task: CrawlTask) -> list[Path]:
+        """本次任务开始之后产出的评论结果文件（实时进度与导入共用）。"""
+        try:
+            client = MediaCrawlerClient()
+        except Exception:
+            return []
+        root = client.project_root / "data" / "douyin"
+        search_dirs = [d for d in (root / "json", root / "jsonl", root) if d.is_dir()]
+        if not search_dirs:
+            return []
+        started_ts = task.started_at.timestamp() if task.started_at else None
+        files: list[Path] = []
+        for d in search_dirs:
+            for pattern in ("*_comments_*.json", "*_comments_*.jsonl"):
+                for p in d.glob(pattern):
+                    if not p.is_file():
+                        continue
+                    if started_ts is not None and p.stat().st_mtime < started_ts - 1:
+                        continue
+                    files.append(p)
+        return files
+
     def _auto_import_results(self, task: CrawlTask) -> None:
         """读取 MediaCrawler 输出目录最新 JSON 结果，自动走 import_comments 入库。"""
         try:
-            client = MediaCrawlerClient()
-            data_dir = client.project_root / "data" / "douyin"
-            if not data_dir.exists():
+            # 只认评论文件：内容文件（*_contents_*）不是商机，混入会污染线索池
+            comment_files = self._fresh_comment_files(task)
+            if not comment_files:
                 return
+
+            # 只取本次任务开始之后产出的结果，避免把历史文件反复导入
             json_files = sorted(
-                [p for p in data_dir.glob("*.json") if p.is_file()],
+                comment_files,
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
-            )
-            if not json_files:
-                return
+            )[:10]   # 只取最新的若干个结果文件
 
             items: list[CrawlImportItem] = []
             for path in json_files[:10]:   # 只取最新的若干个结果文件
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                records = data if isinstance(data, list) else [data]
-                for rec in records:
+                for rec in self._read_records(path):
                     if isinstance(rec, dict):
                         items.append(self._record_to_import_item(rec))
 
@@ -696,6 +794,132 @@ class CrawlService:
                 "采集结果自动导入失败（best-effort，不影响任务状态）: task_id=%s err=%s",
                 task.id, e, exc_info=True,
             )
+
+    # ═══════════════════════════════════════════════════════════
+    # v009 · 视频标题（评论文件里没有，得从内容文件按 aweme_id 取）
+    # ═══════════════════════════════════════════════════════════
+
+    _title_cache: dict = {"sig": "", "map": {}}
+
+    def _content_files(self) -> list[Path]:
+        """MediaCrawler 输出目录里的内容（视频）结果文件。"""
+        try:
+            client = MediaCrawlerClient()
+        except Exception:
+            return []
+        root = client.project_root / "data" / "douyin"
+        search_dirs = [d for d in (root / "json", root / "jsonl", root) if d.is_dir()]
+        files: list[Path] = []
+        for d in search_dirs:
+            for pattern in ("*_contents_*.json", "*_contents_*.jsonl"):
+                files.extend(p for p in d.glob(pattern) if p.is_file())
+        return files
+
+    def _video_title_map(self, force: bool = False) -> dict[str, str]:
+        """aweme_id → 视频标题（desc/title 任一，取先有值的那个）。
+
+        按文件 mtime+size 做签名缓存：采集期间文件内容不变时不重复扫盘。
+        """
+        files = self._content_files()
+        try:
+            sig = "|".join(f"{p}:{p.stat().st_mtime}:{p.stat().st_size}" for p in files)
+        except OSError:
+            sig = ""
+        if not force and sig and self._title_cache.get("sig") == sig:
+            return dict(self._title_cache.get("map") or {})
+
+        mapping: dict[str, str] = {}
+        for path in files:
+            for rec in self._read_records(path):
+                if not isinstance(rec, dict):
+                    continue
+                aweme_id = str(rec.get("aweme_id") or "").strip()
+                if not aweme_id or aweme_id in mapping:
+                    continue
+                title = str(rec.get("title") or rec.get("desc") or "").strip()
+                if title:
+                    mapping[aweme_id] = title
+        self._title_cache["sig"] = sig
+        self._title_cache["map"] = mapping
+        return dict(mapping)
+
+    def backfill_video_titles(self) -> dict:
+        """把库里缺失的视频名称一次性补齐（存量数据修复）。
+
+        来源：MediaCrawler 内容文件里的 aweme_id → 标题映射。
+        同时更新 leads.video 与 comment_tasks.video_title。
+        """
+        mapping = self._video_title_map(force=True)
+        if not mapping:
+            return {"scanned": 0, "leads_updated": 0, "tasks_updated": 0, "title_count": 0}
+
+        def _aweme_id(url: str, video_id: str) -> str:
+            vid = (video_id or "").strip()
+            if vid:
+                return vid
+            m = re.search(r"/video/(\d+)", url or "")
+            return m.group(1) if m else ""
+
+        leads_updated = 0
+        tasks_updated = 0
+        for lead in self._repo.list_leads():
+            if (lead.video or "").strip():
+                continue
+            aid = _aweme_id(lead.source_url, lead.video_id)
+            title = mapping.get(aid, "")
+            if not title:
+                continue
+            lead.video = title
+            if not lead.video_id and aid:
+                lead.video_id = aid
+            lead.updated_at = now_utc()
+            self._repo.save_lead(lead)
+            leads_updated += 1
+
+        for task in self._repo.list_comment_tasks():
+            if (task.video_title or "").strip():
+                continue
+            aid = _aweme_id(task.video_url, task.video_id)
+            title = mapping.get(aid, "")
+            if not title:
+                continue
+            task.video_title = title
+            if not task.video_id and aid:
+                task.video_id = aid
+            task.updated_at = now_utc()
+            self._repo.save_comment_task(task)
+            tasks_updated += 1
+
+        return {
+            "scanned": len(mapping),
+            "leads_updated": leads_updated,
+            "tasks_updated": tasks_updated,
+            "title_count": len(mapping),
+        }
+
+    @staticmethod
+    def _read_records(path: Path) -> list:
+        """读取结果文件为记录列表，兼容 .json（数组）与 .jsonl（每行一个对象）。"""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        if path.suffix.lower() == ".jsonl":
+            records = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return records
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        return data if isinstance(data, list) else [data]
 
     @staticmethod
     def _record_to_import_item(rec: dict) -> CrawlImportItem:

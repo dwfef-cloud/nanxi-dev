@@ -1,4 +1,4 @@
-"""
+﻿"""
 OnboardingService · 上手向导业务逻辑
 =======================================
 5 步配置聚合提交，保存到对应配置表：
@@ -14,7 +14,12 @@ import os
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.request import ProxyHandler, build_opener
 
+# 本机 HTTP_PROXY 会拦截访问 127.0.0.1 的请求，检测本地服务一律绕代理。
+_OPENER = build_opener(ProxyHandler({}))
+
+from app.core import douyin_profile
 from app.models.domain import (
     AudienceProfile, BusinessProfile, ProductKnowledge,
     ScriptStrategy, WeChatSettings,
@@ -96,24 +101,24 @@ class OnboardingService:
         skipped = settings.get("status") == "skipped"
 
         # 逐步骤判断是否已填写
+        # 注：原第 4 步「话术策略」已删除（话术只在「话术库」一处维护），故共 4 步。
         biz = self._repo.get_business_profile()
         pk = self._repo.get_product_knowledge()
         ap = self._repo.get_audience_profile()
-        ss = self._repo.get_script_strategy()
         ws = self._repo.get_wechat_settings()
 
         steps = {
-            "business": any([biz.industry, biz.product, biz.service_area, biz.target_customer]),
+            "business": any([biz.industry, biz.service_area]),
             "product": any([pk.product_name, pk.description]),
-            "audience": any([ap.name, ap.industry, ap.needs]),
-            "scripts": any([ss.comment_script, ss.private_message_script]),
+            "audience": any([ap.name, ap.needs]),
             "wechat": bool(ws.wechat_id),
         }
         done_count = sum(1 for v in steps.values() if v)
+        total = len(steps)
 
         if skipped:
             status = "skipped"
-        elif done_count >= 5:
+        elif done_count >= total:
             status = "completed"
             # 同步状态标记
             self._repo.set_system_setting("onboarding", "status", "completed")
@@ -126,7 +131,7 @@ class OnboardingService:
             "status": status,
             "skipped": skipped,
             "done_count": done_count,
-            "total": 5,
+            "total": total,
             "steps": steps,
         }
 
@@ -203,7 +208,8 @@ class OnboardingService:
         status = None
         error_message = None
         try:
-            with urllib.request.urlopen(url + "/api/crawler/status", timeout=2) as resp:
+            req = urllib.request.Request(url + "/api/crawler/status")
+            with _OPENER.open(req, timeout=2) as resp:
                 payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
             status = payload.get("status")
             error_message = payload.get("error_message")
@@ -228,13 +234,18 @@ class OnboardingService:
                 "link": None}
 
     def _check_douyin_login(self) -> dict:
-        root = os.environ.get("MEDIA_CRAWLER_ROOT", "").strip() or self._DEFAULT_CRAWLER_ROOT
-        bd = Path(root) / "browser_data"
-        candidates = [
-            bd / "cdp_dy_user_data_dir" / "Default" / "Cookies",
-            bd / "cdp_dy_user_data_dir" / "Cookies",
-        ]
-        candidates += [Path(p) for p in glob.glob(str(bd / "*.json"))]
+        # v008：按当前激活账号的专属目录判定；未选账号时回退默认共享目录
+        aid, profile = douyin_profile.resolve_active_profile(self._repo)
+        label = "抖音登录态"
+        if aid:
+            try:
+                acc = self._repo.get_account(aid)
+                label = f"抖音登录态 · {acc.nickname or acc.name}"
+            except Exception:
+                pass
+        bd = profile
+        candidates = douyin_profile.cookie_candidates(profile)
+        candidates += [Path(p) for p in glob.glob(str(profile / "*.json"))]
 
         hit: Path | None = None
         for p in candidates:
@@ -263,7 +274,7 @@ class OnboardingService:
                 pass
 
         if hit is None:
-            return {"key": "douyin_login", "label": "抖音登录态", "ok": False,
+            return {"key": "douyin_login", "label": label, "ok": False,
                     "detail": "未检测到登录记录",
                     "action": {"type": "goto_step", "label": "去扫码登录", "step": 2},
                     "link": None}
@@ -278,7 +289,7 @@ class OnboardingService:
             detail = f"上次登录 {stamp}，已超过 30 天，可能已失效（登录态会在首次采集时实际验证）"
         else:
             detail = f"上次登录 {stamp}（登录态会在首次采集时实际验证）"
-        return {"key": "douyin_login", "label": "抖音登录态", "ok": True,
+        return {"key": "douyin_login", "label": label, "ok": True,
                 "detail": detail, "action": None, "link": None}
 
     def _check_ai(self) -> dict:
@@ -312,9 +323,9 @@ class OnboardingService:
     def _check_business(self) -> dict:
         try:
             st = self.get_status()
-            done, total = st.get("done_count", 0), st.get("total", 5)
+            done, total = st.get("done_count", 0), st.get("total", 4)
         except Exception:
-            done, total = 0, 5
+            done, total = 0, 4
         return {"key": "business", "label": "业务资料", "ok": done >= total,
                 "detail": f"{done}/{total} 步已填", "action": None,
                 "link": "#/settings?tab=business"}

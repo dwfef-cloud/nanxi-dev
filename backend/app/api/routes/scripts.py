@@ -102,3 +102,30 @@ def update_variant(
         return service.update_variant(script_id, variant_id, payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/{script_id}/variants/{variant_id}")
+def delete_variant(
+    script_id: str,
+    variant_id: str,
+    service: ScriptService = Depends(get_script_service),
+) -> dict:
+    """删除单个变体（A/B/C）。历史归因记录不清理。"""
+    try:
+        service.delete_variant(script_id, variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "deleted": variant_id}
+
+
+@router.delete("/{script_id}")
+def delete_script(
+    script_id: str,
+    service: ScriptService = Depends(get_script_service),
+) -> dict:
+    """删除整条话术（连带其全部变体）。历史归因记录不清理。"""
+    try:
+        service.delete_script(script_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "deleted": script_id}

@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════
-   评论获客工作台 · 真实 API 对接模块（P3）
+   评论候选池工作台 · 真实 API 对接模块（P3）
    ───────────────────────────────────────────────────────────
-   覆盖「评论获客」视图所需的端点：
+   覆盖「评论候选池」视图所需的端点：
      GET  /comments/tasks            评论回复任务列表
      POST /comments/tasks            创建评论回复任务（人工确认后）
      POST /comments/guard-check      话术质检（敏感词 + 话术套路）
@@ -50,14 +50,15 @@
   }
 
   async function apiFetch(path, options = {}) {
+    const { timeout = FETCH_TIMEOUT, ...init } = options; // 允许调用方放宽超时
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
     _showLoading();
     try {
       const res = await fetch(API_BASE + path, {
-        ...options,
+        ...init,
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
       });
       clearTimeout(timeoutId);
       if (!res.ok) {
@@ -131,6 +132,19 @@
     return _normalize(data);
   }
 
+  /** 批量推送到「待办互动 → 评论回复」  POST /api/comments/tasks/push
+   *  评论候选池只是候选池，不在这里回复；选中后推过去，到待办互动才写话术发送。
+   *  返回 {created, skipped, taskIds, items[]}（同一线索已有未闭环任务时跳过） */
+  async function pushCommentTasks(leadIds, opts = {}) {
+    const body = { lead_ids: (leadIds || []).filter(Boolean) };
+    if (opts.account) body.account = opts.account;
+    if (opts.priority) body.priority = opts.priority;
+    if (opts.replyContent) body.reply_content = opts.replyContent;
+    if (opts.replyScriptId) body.reply_script_id = opts.replyScriptId;
+    const data = await apiFetch('/comments/tasks/push', { method: 'POST', body: JSON.stringify(body) });
+    return _normalize(data);
+  }
+
   /* ══════════════════════════════════════════════════════════
      话术质检
      ══════════════════════════════════════════════════════════ */
@@ -161,7 +175,7 @@
       video_title: payload.videoTitle || payload.video_title || '',
       source_keyword: payload.sourceKeyword || payload.source_keyword || '',
     };
-    const data = await apiFetch('/ai/comment-insight', { method: 'POST', body: JSON.stringify(body) });
+    const data = await apiFetch('/ai/comment-insight', { method: 'POST', body: JSON.stringify(body), timeout: 120000 }); // AI 慢，放宽
     return _normalize(data);
   }
 
@@ -175,7 +189,7 @@
       scenario: payload.scenario || 'auto',
       industry: payload.industry || 'other',
     };
-    const data = await apiFetch('/ai/comment-suggestion', { method: 'POST', body: JSON.stringify(body) });
+    const data = await apiFetch('/ai/comment-suggestion', { method: 'POST', body: JSON.stringify(body), timeout: 120000 }); // AI 慢，放宽
     return _normalize(data) || { suggestions: [] };
   }
 
@@ -209,6 +223,7 @@
   Object.assign(window.MOCK_API, {
     getCommentGrowthTasks,
     createCommentGrowthTask,
+    pushCommentTasks,
     guardCheck,
     listGuardRules,
     commentInsight,

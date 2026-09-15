@@ -6,6 +6,8 @@
 import logging
 from datetime import datetime, timezone
 
+from app.core import douyin_profile
+from app.core.mediacrawler_runtime import set_account_user_data_dir
 from app.models.domain import Account
 from app.repositories.base import Repository
 from app.schemas.account import AccountCreate, AccountRead, AccountUpdate
@@ -54,6 +56,13 @@ class AccountService:
             limit_status="healthy",
         )
         saved = self._repo.save_account(account)
+        # v008：分配账号专属登录目录（此刻还没有 Cookie，只是先定下"这个账号用哪份目录"）
+        try:
+            if not saved.profile_dir:
+                saved.profile_dir = douyin_profile.profile_dir_for(saved.id).name
+                saved = self._repo.save_account(saved)
+        except Exception as e:
+            logger.warning("分配账号登录目录失败: account_id=%s err=%s", saved.id, e)
         # 埋点：账号就绪/登录（best-effort）
         try:
             _tracking.record_account_event(
@@ -66,6 +75,88 @@ class AccountService:
                 saved.id, e, exc_info=True,
             )
         return saved
+
+    # ═══════════════════════════════════════════════════════
+    # v008：多账号登录态隔离
+    # ═══════════════════════════════════════════════════════
+
+    def activate_account(self, account_id: str) -> dict:
+        """切换当前使用的抖音账号：之后采集 / 评论都用该账号那份登录态。
+
+        只记录"用哪个账号"，不搬运任何 Cookie —— 该账号首次仍需扫码一次，
+        扫码后 Cookie 常驻其专属目录，之后切回来免扫。
+        """
+        account = self._repo.get_account(account_id)  # 不存在时 KeyError → 路由转 404
+        if not account.profile_dir:
+            account.profile_dir = douyin_profile.profile_dir_for(account.id).name
+            account = self._repo.save_account(account)
+        douyin_profile.set_active_account_id(self._repo, account.id)
+        try:
+            set_account_user_data_dir(douyin_profile.user_data_dir_name_for(account.id))
+        except Exception as e:
+            logger.warning("切换 MediaCrawler 登录目录失败: %s", e)
+        profile = douyin_profile.profile_dir_for(account.id)
+        # 新账号目录为空时，继承当前已有的登录态，省掉一次扫码
+        inherited = douyin_profile.inherit_login(profile)
+        # 评论浏览器是独立子进程，靠状态文件拿到"当前账号用哪个目录"
+        douyin_profile.write_active_profile(account.id, profile, account.nickname or account.name)
+        return {
+            "accountId": account.id,
+            "nickname": account.nickname or account.name,
+            "profileDir": str(profile),
+            "loggedIn": douyin_profile.profile_has_login(profile),
+            "inherited": inherited,
+        }
+
+    def get_active_account(self) -> dict:
+        """当前激活账号 + 其登录目录 + 该目录是否已有登录态。"""
+        aid, profile = douyin_profile.resolve_active_profile(self._repo)
+        nickname = None
+        if aid:
+            try:
+                acc = self._repo.get_account(aid)
+                nickname = acc.nickname or acc.name
+            except KeyError:
+                aid = None
+        return {
+            "accountId": aid,
+            "nickname": nickname,
+            "profileDir": str(profile),
+            "loggedIn": douyin_profile.profile_has_login(profile),
+        }
+
+    def sync_douyin_account(self) -> Account:
+        """扫码登录后，把当前激活账号标记为已登录（写回账号列表）。
+
+        判定目录由 core.douyin_profile 给出：选中了账号就查该账号专属目录，
+        未选则沿用默认共享目录。多账号各自登录、互不覆盖。
+        """
+        aid, profile = douyin_profile.resolve_active_profile(self._repo)
+        if not douyin_profile.profile_has_login(profile):
+            raise ValueError("未检测到抖音登录态，请先在「上线向导 → 扫码登录」完成抖音扫码")
+
+        target_id = aid or "douyin:active"
+        try:
+            existing = self._repo.get_account(target_id)
+            existing.status = "active"
+            existing.factors = {**(existing.factors or {}), "login": "good"}
+            existing.health_score = self._calc_health_score(existing.factors)
+            existing.updated_at = datetime.now(timezone.utc)
+            return self._repo.save_account(existing)
+        except KeyError:
+            account = Account(
+                id=target_id,
+                nickname="抖音登录账号",
+                name="抖音登录账号",
+                platform="douyin",
+                daily_limit=80,
+                health_score=100,
+                factors={k: "good" for k in _FACTOR_KEYS},
+                limit_status="healthy",
+                status="active",
+                profile_dir=douyin_profile.profile_dir_for(target_id).name,
+            )
+            return self._repo.save_account(account)
 
     def update_account(self, account_id: str, payload: AccountUpdate) -> Account:
         """更新账号。

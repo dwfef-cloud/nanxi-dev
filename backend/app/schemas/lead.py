@@ -23,6 +23,7 @@ class LeadCreate(_Camel):
     video: str = ""
     source_url: str = ""
     source_keyword: str = ""
+    source_task_id: str = ""   # 采集任务溯源（候选池按任务名筛选用）
     referral_note: str | None = None
     # ── 精准获客（v002）：评论级溯源 ──
     video_id: str = ""

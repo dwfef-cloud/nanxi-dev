@@ -55,46 +55,55 @@
     }
   }
 
-  /* ── 统一 apiFetch：10秒超时 / HTTP错误 / 网络错误 ── */
+  /* ── 统一 apiFetch：10秒超时 / HTTP错误 / 网络错误 ──
+     · GET（无 body）不带 Content-Type，避免触发多余的 CORS 预检
+     · 网络层瞬时失败（TypeError）对 GET 自动重试 2 次，规避本地回环偶发断连 */
   async function apiFetch(path, options = {}) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-    _showLoading();
-    try {
-      const res = await fetch(API_BASE + path, {
-        ...options,
-        signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
-        let detail = '';
-        try {
-          const j = await res.json();
-          // FastAPI 校验错误 detail 可能是数组
-          if (Array.isArray(j.detail)) {
-            detail = j.detail.map((d) => d.msg || JSON.stringify(d)).join('；');
-          } else {
-            detail = j.detail || '';
+    const { timeout = FETCH_TIMEOUT, ...init } = options; // 允许调用方放宽超时
+    const method = (init.method || 'GET').toUpperCase();
+    const canRetry = method === 'GET';
+    for (let attempt = 0; ; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      const headers = { ...(init.headers || {}) };
+      if (init.body != null && headers['Content-Type'] == null) headers['Content-Type'] = 'application/json';
+      _showLoading();
+      try {
+        const res = await fetch(API_BASE + path, { ...init, signal: controller.signal, headers });
+        clearTimeout(timeoutId);
+        if (!res.ok) {
+          let detail = '';
+          try {
+            const j = await res.json();
+            // FastAPI 校验错误 detail 可能是数组
+            if (Array.isArray(j.detail)) {
+              detail = j.detail.map((d) => d.msg || JSON.stringify(d)).join('；');
+            } else {
+              detail = j.detail || '';
+            }
+          } catch (e) { /* ignore */ }
+          const err = new Error('HTTP ' + res.status + (detail ? '：' + detail : ''));
+          err.status = res.status;
+          throw err;
+        }
+        if (res.status === 204) return null;
+        return await res.json();
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('请求超时，请检查后端服务是否启动');
+        }
+        if (err instanceof TypeError) {
+          if (canRetry && attempt < 2) {
+            await new Promise((r) => setTimeout(r, 180 * (attempt + 1)));
+            continue;
           }
-        } catch (e) { /* ignore */ }
-        const err = new Error('HTTP ' + res.status + (detail ? '：' + detail : ''));
-        err.status = res.status;
+          throw new Error('网络错误，请检查后端服务是否启动（' + err.message + '）');
+        }
         throw err;
+      } finally {
+        _hideLoading();
       }
-      if (res.status === 204) return null;
-      return res.json();
-    } catch (err) {
-      clearTimeout(timeoutId);
-      if (err.name === 'AbortError') {
-        throw new Error('请求超时，请检查后端服务是否启动');
-      }
-      if (err instanceof TypeError) {
-        throw new Error('网络错误，请检查后端服务是否启动（' + err.message + '）');
-      }
-      throw err;
-    } finally {
-      _hideLoading();
     }
   }
 
@@ -238,6 +247,86 @@
     }));
   }
 
+  /* ════════ 画像记录集（多条记录 + 主记录）════════
+     card ∈ business / product / audience / wechat
+     每条记录独立保存、互不覆盖；isPrimary=1 的那条是「主记录」，
+     话术变量与 AI 生成都取主记录。 */
+
+  /** 列表（主记录排最前） */
+  async function listProfileRecords(card) {
+    return _normalize(await apiFetch('/workbench/records/' + encodeURIComponent(card)));
+  }
+
+  /** 新增一条（新记录默认成为主记录） */
+  async function createProfileRecord(card, payload) {
+    return _normalize(await apiFetch('/workbench/records/' + encodeURIComponent(card), {
+      method: 'POST',
+      body: JSON.stringify(_snakeify(payload || {})),
+    }));
+  }
+
+  /** 更新指定一条 */
+  async function updateProfileRecord(card, recordId, payload) {
+    return _normalize(await apiFetch(
+      '/workbench/records/' + encodeURIComponent(card) + '/' + encodeURIComponent(recordId),
+      { method: 'PUT', body: JSON.stringify(_snakeify(payload || {})) },
+    ));
+  }
+
+  /** 删除指定一条（删的是主记录时会自动补主） */
+  async function deleteProfileRecord(card, recordId) {
+    return _normalize(await apiFetch(
+      '/workbench/records/' + encodeURIComponent(card) + '/' + encodeURIComponent(recordId),
+      { method: 'DELETE' },
+    ));
+  }
+
+  /** 设为唯一主记录 */
+  async function setPrimaryProfileRecord(card, recordId) {
+    return _normalize(await apiFetch(
+      '/workbench/records/' + encodeURIComponent(card) + '/' + encodeURIComponent(recordId) + '/primary',
+      { method: 'POST' },
+    ));
+  }
+
+  /* ════════ P3 · 资料文件导入 ════════ */
+
+  /**
+   * 上传资料文件：解析 + AI 抽取（dry run，不写库）
+   * POST /api/materials/import  (base64 JSON，零依赖，无需 python-multipart)
+   */
+  async function importMaterial(file) {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    const b64 = btoa(bin);
+    return _normalize(await apiFetch('/materials/import', {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, content: b64 }),
+    }));
+  }
+
+  /**
+   * 确认写入抽取结果（upsert 画像 + 草稿话术）
+   * POST /api/materials/apply
+   */
+  async function applyImport(payload) {
+    return _normalize(await apiFetch('/materials/apply', {
+      method: 'POST',
+      body: JSON.stringify({
+        business: payload.business || {},
+        product: payload.product || {},
+        audience: payload.audience || {},
+        scriptHints: payload.scriptHints || {},
+        makeDraftScripts: payload.makeDraftScripts !== false,
+      }),
+    }));
+  }
+
   /* ════════ 上线自检 ════════ */
 
   /**
@@ -335,5 +424,14 @@
     /* 第5步 微信转化 */
     getWeChatSettings,
     saveWeChatSettings,
+    /* 画像记录集（多条记录 + 主记录） */
+    listProfileRecords,
+    createProfileRecord,
+    updateProfileRecord,
+    deleteProfileRecord,
+    setPrimaryProfileRecord,
+    /* P3 资料文件导入 */
+    importMaterial,
+    applyImport,
   });
 })();

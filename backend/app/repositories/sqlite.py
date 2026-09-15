@@ -1,4 +1,4 @@
-"""
+﻿"""
 SqliteRepository · SQLite 版数据访问实现
 ==========================================
 生产环境持久化实现。完整实现 Repository 接口的 55 个抽象方法。
@@ -72,6 +72,15 @@ def _bool_to_int(b: bool) -> int:
 
 def _int_to_bool(v: int | None) -> bool:
     return bool(v) if v is not None else False
+
+
+def _row_opt(row: sqlite3.Row, key: str, default: str = "") -> str:
+    """读取可能尚未迁移的列。
+
+    新加列由迁移负责，但迁移在启动时才跑；这里对列缺失做兜底，
+    避免旧库在迁移前被读到就 500。
+    """
+    return row[key] if key in row.keys() else default
 
 
 # ═══════════════════════════════════════════════════════════
@@ -311,6 +320,7 @@ class SqliteRepository(Repository):
             last_ban_reason=row["last_ban_reason"],
             r1_note=row["r1_note"],
             r3_note=row["r3_note"],
+            profile_dir=row["profile_dir"] if "profile_dir" in row.keys() else "",
             notes=row["notes"],
             created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
@@ -331,8 +341,9 @@ class SqliteRepository(Repository):
             """INSERT OR REPLACE INTO accounts
                (id, name, nickname, platform, avatar_hue, health_score, factors,
                 limit_status, status, daily_outreach, daily_limit, daily_send_count,
-                risk_level, weight, today_sent, today_success, last_ban_reason, r1_note, r3_note, notes, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                risk_level, weight, today_sent, today_success, last_ban_reason, r1_note, r3_note,
+                profile_dir, notes, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 account.id, account.name, account.nickname, account.platform,
                 account.avatar_hue, account.health_score, _to_json(account.factors),
@@ -340,6 +351,7 @@ class SqliteRepository(Repository):
                 account.daily_limit, account.daily_send_count, account.risk_level,
                 account.weight, account.today_sent, account.today_success,
                 account.last_ban_reason, account.r1_note, account.r3_note,
+                account.profile_dir,
                 account.notes, _dt_to_str(account.created_at), _dt_to_str(account.updated_at),
             ),
         )
@@ -359,6 +371,9 @@ class SqliteRepository(Repository):
             active=_int_to_bool(row["active"]),
             intro=row["intro"],
             welcome_msg=row["welcome_msg"],
+            source=row["source"] if "source" in row.keys() else "manual",
+            generated_from=row["generated_from"] if "generated_from" in row.keys() else "",
+            variables=row["variables"] if "variables" in row.keys() else "",
             created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
@@ -385,16 +400,40 @@ class SqliteRepository(Repository):
     def save_script(self, script: Script) -> Script:
         self._execute(
             """INSERT OR REPLACE INTO scripts
-               (id, name, industry, category, is_main, active, intro, welcome_msg, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               (id, name, industry, category, is_main, active, intro, welcome_msg,
+                source, generated_from, variables, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 script.id, script.name, script.industry, script.category,
                 _bool_to_int(script.is_main), _bool_to_int(script.active),
                 script.intro, script.welcome_msg,
+                script.source or "manual", script.generated_from or "", script.variables or "",
                 _dt_to_str(script.created_at), _dt_to_str(script.updated_at),
             ),
         )
         return script
+
+    def delete_script(self, script_id: str) -> None:
+        """删除话术 + 其全部变体。话术不存在抛 KeyError。
+
+        script_usage / comment_tasks.reply_script_id 是有价值的历史归因，不清理。
+        """
+        if self._query_one("SELECT id FROM scripts WHERE id = ?", (script_id,)) is None:
+            raise KeyError(f"Script not found: {script_id}")
+        self._execute("DELETE FROM script_variants WHERE script_id = ?", (script_id,))
+        self._execute("DELETE FROM scripts WHERE id = ?", (script_id,))
+
+    def delete_variant(self, script_id: str, variant_id: str) -> None:
+        row = self._query_one(
+            "SELECT id FROM script_variants WHERE script_id = ? AND variant_id = ?",
+            (script_id, variant_id),
+        )
+        if row is None:
+            raise KeyError(f"Variant {variant_id} not found in script {script_id}")
+        self._execute(
+            "DELETE FROM script_variants WHERE script_id = ? AND variant_id = ?",
+            (script_id, variant_id),
+        )
 
     def _row_to_variant(self, row: sqlite3.Row) -> ScriptVariant:
         return ScriptVariant(
@@ -458,6 +497,10 @@ class SqliteRepository(Repository):
             lead_id=row["lead_id"],
             comment_content=row["comment_content"],
             video_title=row["video_title"],
+            # v009：三列由迁移补出，老库/老行可能还没跑迁移，取列前先判断
+            comment_author=(row["comment_author"] if "comment_author" in row.keys() else "") or "",
+            comment_time=(row["comment_time"] if "comment_time" in row.keys() else "") or "",
+            video_id=(row["video_id"] if "video_id" in row.keys() else "") or "",
             video_url=row["video_url"],
             comment_id=row["comment_id"],
             reply_failure_reason=row["reply_failure_reason"],
@@ -500,14 +543,16 @@ class SqliteRepository(Repository):
     def save_comment_task(self, task: CommentReplyTask) -> CommentReplyTask:
         self._execute(
             """INSERT OR REPLACE INTO comment_tasks
-               (id, lead_id, comment_content, video_title, video_url, comment_id,
+               (id, lead_id, comment_content, video_title, comment_author, comment_time,
+                video_id, video_url, comment_id,
                 reply_failure_reason, priority, reply_script_id, reply_variant_id,
                 reply_content, status, account, scheduled_at, replied_at, user_visited,
                 user_dm, user_replied_comment, user_reply_content, replier_name, sub_replies,
                 created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 task.id, task.lead_id, task.comment_content, task.video_title,
+                task.comment_author, task.comment_time, task.video_id,
                 task.video_url, task.comment_id, task.reply_failure_reason, task.priority,
                 task.reply_script_id, task.reply_variant_id,
                 task.reply_content, task.status, task.account,
@@ -519,6 +564,12 @@ class SqliteRepository(Repository):
             ),
         )
         return task
+
+    def delete_comment_task(self, task_id: str) -> None:
+        """删除一条评论回复任务"""
+        cur = self._execute("DELETE FROM comment_tasks WHERE id = ?", (task_id,))
+        if cur.rowcount == 0:
+            raise KeyError(f"CommentTask not found: {task_id}")
 
     # ═══════════════════════════════════════════════════════
     # 客户域 · Customer / Log
@@ -989,13 +1040,27 @@ class SqliteRepository(Repository):
         self._execute("DELETE FROM crawl_tasks WHERE id = ?", (task_id,))
 
     # ═══════════════════════════════════════════════════════
-    # 配置域 · 单例
+    # 配置域 · 画像表（多条记录 + 主记录 is_primary）
+    #   get_xxx()            → 主记录（兼容旧调用：话术变量 / AI 生成 / onboarding）
+    #   list_xxx()           → 全部记录（主记录排最前）
+    #   get_xxx_by_id()      → 指定记录
+    #   save_xxx()           → 按 value.id 新增或覆盖那一条
+    #   delete_xxx(id)       → 删除；删的是主记录则自动把最新一条提为主
+    #   set_primary_xxx(id)  → 设为唯一主记录
     # ═══════════════════════════════════════════════════════
 
-    def get_business_profile(self) -> BusinessProfile:
-        row = self._query_one("SELECT * FROM business_profile WHERE id = 'default'")
-        if row is None:
-            return BusinessProfile()
+    def _promote_fallback_primary(self, table: str) -> None:
+        """删掉主记录后，若表内没有主记录，把最新一条提为主"""
+        row = self._query_one(f"SELECT COUNT(*) AS c FROM {table} WHERE is_primary = 1")
+        if row is not None and row["c"]:
+            return
+        self._execute(
+            f"""UPDATE {table} SET is_primary = 1
+                WHERE id = (SELECT id FROM {table} ORDER BY updated_at DESC LIMIT 1)"""
+        )
+
+    @staticmethod
+    def _row_to_business_profile(row: sqlite3.Row) -> BusinessProfile:
         return BusinessProfile(
             id=row["id"],
             industry=row["industry"],
@@ -1005,27 +1070,62 @@ class SqliteRepository(Repository):
             price_range=row["price_range"],
             conversion_goal=row["conversion_goal"],
             tone=row["tone"],
+            self_intro=_row_opt(row, "self_intro"),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
+            is_primary=bool(row["is_primary"]),
+            sort_order=row["sort_order"] or 0,
+            created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
+    def get_business_profile(self) -> BusinessProfile:
+        row = self._query_one(
+            "SELECT * FROM business_profile ORDER BY is_primary DESC, updated_at DESC LIMIT 1"
+        )
+        if row is None:
+            return BusinessProfile()
+        return self._row_to_business_profile(row)
+
+    def list_business_profiles(self) -> list[BusinessProfile]:
+        rows = self._query(
+            "SELECT * FROM business_profile "
+            "ORDER BY is_primary DESC, sort_order ASC, created_at ASC"
+        )
+        return [self._row_to_business_profile(r) for r in rows]
+
+    def get_business_profile_by_id(self, record_id: str) -> BusinessProfile | None:
+        row = self._query_one("SELECT * FROM business_profile WHERE id = ?", (record_id,))
+        return self._row_to_business_profile(row) if row is not None else None
+
     def save_business_profile(self, profile: BusinessProfile) -> BusinessProfile:
+        # 主记录唯一：写入的这条是主记录时，先把其它记录降级
+        if profile.is_primary:
+            self._execute("UPDATE business_profile SET is_primary = 0 WHERE id != ?", (profile.id,))
         self._execute(
             """INSERT OR REPLACE INTO business_profile
                (id, industry, product, service_area, target_customer,
-                price_range, conversion_goal, tone, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                price_range, conversion_goal, tone, self_intro,
+                is_primary, sort_order, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 profile.id, profile.industry, profile.product, profile.service_area,
-                profile.target_customer, profile.price_range, profile.conversion_goal,
-                profile.tone, _dt_to_str(profile.updated_at),
+                profile.target_customer, profile.price_range,
+                profile.conversion_goal, profile.tone, profile.self_intro,
+                1 if profile.is_primary else 0, profile.sort_order,
+                _dt_to_str(profile.created_at), _dt_to_str(profile.updated_at),
             ),
         )
         return profile
 
-    def get_product_knowledge(self) -> ProductKnowledge:
-        row = self._query_one("SELECT * FROM product_knowledge WHERE id = 'default'")
-        if row is None:
-            return ProductKnowledge()
+    def delete_business_profile(self, record_id: str) -> None:
+        self._execute("DELETE FROM business_profile WHERE id = ?", (record_id,))
+        self._promote_fallback_primary("business_profile")
+
+    def set_primary_business_profile(self, record_id: str) -> None:
+        self._execute("UPDATE business_profile SET is_primary = 0")
+        self._execute("UPDATE business_profile SET is_primary = 1 WHERE id = ?", (record_id,))
+
+    @staticmethod
+    def _row_to_product_knowledge(row: sqlite3.Row) -> ProductKnowledge:
         return ProductKnowledge(
             id=row["id"],
             product_name=row["product_name"],
@@ -1035,27 +1135,62 @@ class SqliteRepository(Repository):
             price_range=row["price_range"],
             faq=row["faq"],
             forbidden_claims=row["forbidden_claims"],
+            service_process=_row_opt(row, "service_process"),
+            case_studies=_row_opt(row, "case_studies"),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
+            is_primary=bool(row["is_primary"]),
+            sort_order=row["sort_order"] or 0,
+            created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
+    def get_product_knowledge(self) -> ProductKnowledge:
+        row = self._query_one(
+            "SELECT * FROM product_knowledge ORDER BY is_primary DESC, updated_at DESC LIMIT 1"
+        )
+        if row is None:
+            return ProductKnowledge()
+        return self._row_to_product_knowledge(row)
+
+    def list_product_knowledge(self) -> list[ProductKnowledge]:
+        rows = self._query(
+            "SELECT * FROM product_knowledge "
+            "ORDER BY is_primary DESC, sort_order ASC, created_at ASC"
+        )
+        return [self._row_to_product_knowledge(r) for r in rows]
+
+    def get_product_knowledge_by_id(self, record_id: str) -> ProductKnowledge | None:
+        row = self._query_one("SELECT * FROM product_knowledge WHERE id = ?", (record_id,))
+        return self._row_to_product_knowledge(row) if row is not None else None
+
     def save_product_knowledge(self, value: ProductKnowledge) -> ProductKnowledge:
+        if value.is_primary:
+            self._execute("UPDATE product_knowledge SET is_primary = 0 WHERE id != ?", (value.id,))
         self._execute(
             """INSERT OR REPLACE INTO product_knowledge
                (id, product_name, description, selling_points, target_customers,
-                price_range, faq, forbidden_claims, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                price_range, faq, forbidden_claims, service_process, case_studies,
+                is_primary, sort_order, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 value.id, value.product_name, value.description, value.selling_points,
                 value.target_customers, value.price_range, value.faq,
-                value.forbidden_claims, _dt_to_str(value.updated_at),
+                value.forbidden_claims, value.service_process, value.case_studies,
+                1 if value.is_primary else 0, value.sort_order,
+                _dt_to_str(value.created_at), _dt_to_str(value.updated_at),
             ),
         )
         return value
 
-    def get_audience_profile(self) -> AudienceProfile:
-        row = self._query_one("SELECT * FROM audience_profile WHERE id = 'default'")
-        if row is None:
-            return AudienceProfile()
+    def delete_product_knowledge(self, record_id: str) -> None:
+        self._execute("DELETE FROM product_knowledge WHERE id = ?", (record_id,))
+        self._promote_fallback_primary("product_knowledge")
+
+    def set_primary_product_knowledge(self, record_id: str) -> None:
+        self._execute("UPDATE product_knowledge SET is_primary = 0")
+        self._execute("UPDATE product_knowledge SET is_primary = 1 WHERE id = ?", (record_id,))
+
+    @staticmethod
+    def _row_to_audience_profile(row: sqlite3.Row) -> AudienceProfile:
         return AudienceProfile(
             id=row["id"],
             name=row["name"],
@@ -1065,22 +1200,58 @@ class SqliteRepository(Repository):
             pain_points=row["pain_points"],
             intent_keywords=row["intent_keywords"],
             excluded_keywords=row["excluded_keywords"],
+            excluded_customers=_row_opt(row, "excluded_customers"),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
+            is_primary=bool(row["is_primary"]),
+            sort_order=row["sort_order"] or 0,
+            created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
+    def get_audience_profile(self) -> AudienceProfile:
+        row = self._query_one(
+            "SELECT * FROM audience_profile ORDER BY is_primary DESC, updated_at DESC LIMIT 1"
+        )
+        if row is None:
+            return AudienceProfile()
+        return self._row_to_audience_profile(row)
+
+    def list_audience_profiles(self) -> list[AudienceProfile]:
+        rows = self._query(
+            "SELECT * FROM audience_profile "
+            "ORDER BY is_primary DESC, sort_order ASC, created_at ASC"
+        )
+        return [self._row_to_audience_profile(r) for r in rows]
+
+    def get_audience_profile_by_id(self, record_id: str) -> AudienceProfile | None:
+        row = self._query_one("SELECT * FROM audience_profile WHERE id = ?", (record_id,))
+        return self._row_to_audience_profile(row) if row is not None else None
+
     def save_audience_profile(self, value: AudienceProfile) -> AudienceProfile:
+        if value.is_primary:
+            self._execute("UPDATE audience_profile SET is_primary = 0 WHERE id != ?", (value.id,))
         self._execute(
             """INSERT OR REPLACE INTO audience_profile
                (id, name, industry, region, needs, pain_points,
-                intent_keywords, excluded_keywords, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                intent_keywords, excluded_keywords, excluded_customers,
+                is_primary, sort_order, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 value.id, value.name, value.industry, value.region, value.needs,
                 value.pain_points, value.intent_keywords, value.excluded_keywords,
-                _dt_to_str(value.updated_at),
+                value.excluded_customers,
+                1 if value.is_primary else 0, value.sort_order,
+                _dt_to_str(value.created_at), _dt_to_str(value.updated_at),
             ),
         )
         return value
+
+    def delete_audience_profile(self, record_id: str) -> None:
+        self._execute("DELETE FROM audience_profile WHERE id = ?", (record_id,))
+        self._promote_fallback_primary("audience_profile")
+
+    def set_primary_audience_profile(self, record_id: str) -> None:
+        self._execute("UPDATE audience_profile SET is_primary = 0")
+        self._execute("UPDATE audience_profile SET is_primary = 1 WHERE id = ?", (record_id,))
 
     def get_script_strategy(self) -> ScriptStrategy:
         row = self._query_one("SELECT * FROM script_strategy WHERE id = 'default'")
@@ -1108,30 +1279,64 @@ class SqliteRepository(Repository):
         )
         return value
 
-    def get_wechat_settings(self) -> WeChatSettings:
-        row = self._query_one("SELECT * FROM wechat_settings WHERE id = 'default'")
-        if row is None:
-            return WeChatSettings()
+    @staticmethod
+    def _row_to_wechat_settings(row: sqlite3.Row) -> WeChatSettings:
         return WeChatSettings(
             id=row["id"],
             wechat_id=row["wechat_id"],
             guide_timing=row["guide_timing"],
             guide_reason=row["guide_reason"],
             compliance_note=row["compliance_note"],
+            offer_hook=_row_opt(row, "offer_hook"),
             updated_at=_str_to_dt(row["updated_at"]) or datetime.now(timezone.utc),
+            is_primary=bool(row["is_primary"]),
+            sort_order=row["sort_order"] or 0,
+            created_at=_str_to_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
+    def get_wechat_settings(self) -> WeChatSettings:
+        row = self._query_one(
+            "SELECT * FROM wechat_settings ORDER BY is_primary DESC, updated_at DESC LIMIT 1"
+        )
+        if row is None:
+            return WeChatSettings()
+        return self._row_to_wechat_settings(row)
+
+    def list_wechat_settings(self) -> list[WeChatSettings]:
+        rows = self._query(
+            "SELECT * FROM wechat_settings "
+            "ORDER BY is_primary DESC, sort_order ASC, created_at ASC"
+        )
+        return [self._row_to_wechat_settings(r) for r in rows]
+
+    def get_wechat_settings_by_id(self, record_id: str) -> WeChatSettings | None:
+        row = self._query_one("SELECT * FROM wechat_settings WHERE id = ?", (record_id,))
+        return self._row_to_wechat_settings(row) if row is not None else None
+
     def save_wechat_settings(self, value: WeChatSettings) -> WeChatSettings:
+        if value.is_primary:
+            self._execute("UPDATE wechat_settings SET is_primary = 0 WHERE id != ?", (value.id,))
         self._execute(
             """INSERT OR REPLACE INTO wechat_settings
-               (id, wechat_id, guide_timing, guide_reason, compliance_note, updated_at)
-               VALUES (?,?,?,?,?,?)""",
+               (id, wechat_id, guide_timing, guide_reason, compliance_note, offer_hook,
+                is_primary, sort_order, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 value.id, value.wechat_id, value.guide_timing, value.guide_reason,
-                value.compliance_note, _dt_to_str(value.updated_at),
+                value.compliance_note, value.offer_hook,
+                1 if value.is_primary else 0, value.sort_order,
+                _dt_to_str(value.created_at), _dt_to_str(value.updated_at),
             ),
         )
         return value
+
+    def delete_wechat_settings(self, record_id: str) -> None:
+        self._execute("DELETE FROM wechat_settings WHERE id = ?", (record_id,))
+        self._promote_fallback_primary("wechat_settings")
+
+    def set_primary_wechat_settings(self, record_id: str) -> None:
+        self._execute("UPDATE wechat_settings SET is_primary = 0")
+        self._execute("UPDATE wechat_settings SET is_primary = 1 WHERE id = ?", (record_id,))
 
     # ═══════════════════════════════════════════════════════
     # 聚合查询
@@ -1465,6 +1670,52 @@ class SqliteRepository(Repository):
         else:
             rows = self._query("SELECT * FROM script_usage ORDER BY used_at")
         return [self._row_to_script_usage(r) for r in rows]
+
+    def variant_usage_stats(self) -> dict[tuple[str, str], dict[str, int]]:
+        """按 (script_id, variant_id) 聚合话术变体的真实效果。
+
+        - sent / wechat_added 来自 script_usage：每发一次记一行，
+          result 变成 wechat_added / deal_won 时算一次加微成功；
+        - replied 来自 comment_tasks：用该变体发出的评论被对方追评（user_replied_comment=1）。
+
+        以前 variant 表上的 conv_rate / replied / wechat_added 三列没有任何写入点，
+        导致话术库的转化率面板恒为空、R2 自动停用永不触发。这里改成实时聚合，
+        不再依赖那几列冗余值。
+        """
+        stats: dict[tuple[str, str], dict[str, int]] = {}
+        rows = self._query(
+            """SELECT script_id, variant_id,
+                      COUNT(*) AS sent,
+                      SUM(CASE WHEN result IN ('wechat_added', 'deal_won') THEN 1 ELSE 0 END)
+                          AS wechat_added
+               FROM script_usage
+               WHERE script_id IS NOT NULL AND script_id != ''
+               GROUP BY script_id, variant_id"""
+        )
+        for r in rows:
+            stats[(r["script_id"], r["variant_id"] or "")] = {
+                "sent": r["sent"] or 0,
+                "replied": 0,
+                "wechat_added": r["wechat_added"] or 0,
+            }
+
+        rows = self._query(
+            """SELECT reply_script_id AS script_id,
+                      reply_variant_id AS variant_id,
+                      COUNT(*) AS replied
+               FROM comment_tasks
+               WHERE reply_script_id IS NOT NULL AND reply_script_id != ''
+                 AND user_replied_comment = 1
+               GROUP BY reply_script_id, reply_variant_id"""
+        )
+        for r in rows:
+            entry = stats.setdefault(
+                (r["script_id"], r["variant_id"] or ""),
+                {"sent": 0, "replied": 0, "wechat_added": 0},
+            )
+            entry["replied"] = r["replied"] or 0
+
+        return stats
 
     # ═══════════════════════════════════════════════════════
     # 账号操作审计域 · AccountEvent（埋点补全 Task5）

@@ -1,4 +1,4 @@
-"""
+﻿"""
 获客系统 v1.0 · 领域模型定义
 ================================
 数据底座 · 所有子智能体共享的统一模型。
@@ -60,9 +60,10 @@ IntentLevel = Literal["A", "B", "C", "D"]
 IntentTag = Literal["high", "mid", "low"]
 
 # 商机阶段（7 阶段，前端 STAGE_META）
+# 通用成交流程，不绑定任何行业（原 measured「已量房」为装修专属，已改为 discovery「需求沟通」）
 CustomerStage = Literal[
     "added",       # 已加微
-    "measured",    # 已量房
+    "discovery",   # 需求沟通
     "proposal",    # 方案中
     "quoted",      # 已报价
     "negotiating", # 谈判中
@@ -91,6 +92,7 @@ LostReasonCategory = Literal["price", "competitor", "no_need", "timing", "contac
 # 话术分类（评论引流策略下分四类）
 ScriptCategory = Literal[
     "comment",        # 评论区回复话术
+    "welcome",        # 欢迎语/首句筛选话术（用户进私信后第一句）
     "private_message",# 私信话术
     "wechat_guide",   # 微信引导话术
     "objection",      # 异议处理话术
@@ -265,6 +267,8 @@ class Account:
     r1_note: str | None = None                # R1 命中说明
     r3_note: str | None = None                # R3 安全模式说明
 
+    # v008：账号专属 Chrome 登录目录名（空 = 沿用默认共享目录 cdp_dy_user_data_dir）
+    profile_dir: str = ""
     notes: str = ""
     created_at: datetime = field(default_factory=now_utc)
     updated_at: datetime = field(default_factory=now_utc)
@@ -283,6 +287,10 @@ class Script:
     active: bool = True
     intro: str = ""
     welcome_msg: str = ""                     # 加微后欢迎语
+    # ── P2：画像 → 话术 贯通字段 ──
+    source: str = "manual"                     # manual / generated / imported / legacy
+    generated_from: str = ""                   # 生成时画像快照（JSON）
+    variables: str = ""                        # 用到的变量列表（JSON）
     id: str = field(default_factory=_new_id)
     created_at: datetime = field(default_factory=now_utc)
     updated_at: datetime = field(default_factory=now_utc)
@@ -329,6 +337,12 @@ class CommentReplyTask:
     lead_id: str
     comment_content: str = ""                 # 对方评论原文
     video_title: str = ""                     # 所在视频
+    # ── v009：完整上下文（评论人 / 评论时间 / 视频 ID）──
+    # 评论候选池是候选池，推送过来后「待办互动 → 评论回复」要能直接看到
+    # 谁评论的、什么时候评论的、哪个视频，不再回头查线索。
+    comment_author: str = ""                  # 评论人昵称（对方）
+    comment_time: str = ""                    # 评论时间（原始时间戳或 ISO 串）
+    video_id: str = ""                        # 视频 ID（标题缺失时用于定位/展示）
     # ── 精准获客（v002） ──
     video_url: str = ""                       # 视频链接（冗余存储，便于直接打开）
     comment_id: str = ""                      # 评论 ID
@@ -546,7 +560,8 @@ class LeadBehaviorEvent:
 
 
 # ═══════════════════════════════════════════════════════════
-# 配置域（工作台配置 · 单例）
+# 配置域（工作台配置 · 画像表：支持多条记录 + 主记录 is_primary）
+#   is_primary=1 的那条是「主记录」，话术变量 / AI 生成 / 旧单数接口都取它。
 # ═══════════════════════════════════════════════════════════
 
 @dataclass(slots=True)
@@ -558,8 +573,12 @@ class BusinessProfile:
     price_range: str = ""
     conversion_goal: str = "添加微信"
     tone: str = "专业、真诚"
+    self_intro: str = ""                      # 自我介绍 / 账号人设（v012）
     id: str = "default"
     updated_at: datetime = field(default_factory=now_utc)
+    is_primary: bool = True
+    sort_order: int = 0
+    created_at: datetime = field(default_factory=now_utc)
 
 
 @dataclass(slots=True)
@@ -571,8 +590,13 @@ class ProductKnowledge:
     price_range: str = ""
     faq: str = ""
     forbidden_claims: str = ""
+    service_process: str = ""                 # 服务流程与交付周期（v012）
+    case_studies: str = ""                    # 成功案例 / 客户见证（v012）
     id: str = "default"
     updated_at: datetime = field(default_factory=now_utc)
+    is_primary: bool = True
+    sort_order: int = 0
+    created_at: datetime = field(default_factory=now_utc)
 
 
 @dataclass(slots=True)
@@ -584,8 +608,12 @@ class AudienceProfile:
     pain_points: str = ""
     intent_keywords: str = ""
     excluded_keywords: str = ""
+    excluded_customers: str = ""              # 不接什么样的客户（v012）
     id: str = "default"
     updated_at: datetime = field(default_factory=now_utc)
+    is_primary: bool = True
+    sort_order: int = 0
+    created_at: datetime = field(default_factory=now_utc)
 
 
 @dataclass(slots=True)
@@ -604,8 +632,12 @@ class WeChatSettings:
     guide_timing: str = "客户明确表达兴趣后"
     guide_reason: str = "发送详细方案和案例"
     compliance_note: str = ""
+    offer_hook: str = ""                      # 优惠 / 钩子（v012）
     id: str = "default"
     updated_at: datetime = field(default_factory=now_utc)
+    is_primary: bool = True
+    sort_order: int = 0
+    created_at: datetime = field(default_factory=now_utc)
 
 
 # ═══════════════════════════════════════════════════════════

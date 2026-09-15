@@ -18,13 +18,14 @@
   const FETCH_TIMEOUT = 15000;
 
   async function apiFetch(path, options = {}) {
+    const { timeout = FETCH_TIMEOUT, ...init } = options; // 允许调用方放宽超时
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
     try {
       const res = await fetch(API_BASE + path, {
-        ...options,
+        ...init,
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
       });
       clearTimeout(timeoutId);
       if (!res.ok) {
@@ -80,6 +81,11 @@
         method: 'POST',
         body: JSON.stringify(payload),
       });
+    },
+
+    /** 回填视频名称：早期入库的线索「视频名称」是空的，按 aweme_id 从内容文件补齐 */
+    async backfillVideoTitles() {
+      return apiFetch('/crawl/backfill-video-titles', { method: 'POST' });
     },
   };
 

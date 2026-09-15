@@ -39,6 +39,19 @@ def update_settings(req: AISettingsUpdate, service: AIService = Depends(get_ai_s
     return service.update_settings(req)
 
 
+@router.get("/models")
+def list_models(service: AIService = Depends(get_ai_service)) -> dict:
+    """拉取当前 OpenAI 兼容 provider 的可用模型列表（用于「大量接入其他模型」）。
+
+    仅 openai provider 支持；返回 { provider, base_url, models: [...] }。
+    """
+    return {
+        "provider": service._provider,
+        "base_url": service._base_url,
+        "models": service.fetch_models(),
+    }
+
+
 # ═══════════════════════════════════════════════════════════
 # 新增：线索画像分析
 # ═══════════════════════════════════════════════════════════

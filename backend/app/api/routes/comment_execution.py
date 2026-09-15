@@ -88,7 +88,7 @@ async def execute_comment(
         raise HTTPException(
             status_code=400,
             detail="来源视频地址无效：需要形如 https://www.douyin.com/video/<19位数字> 的真实地址。"
-                   "当前任务里是占位地址（或为空），请到「评论获客」重新生成带真实视频地址的任务。"
+                   "当前任务里是占位地址（或为空），请到「评论候选池」重新生成带真实视频地址的任务。"
                    + (f"当前值：{video_url}" if video_url else "当前为空。"),
         )
     if not text:

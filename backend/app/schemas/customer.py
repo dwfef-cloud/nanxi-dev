@@ -30,7 +30,7 @@ class CustomerCreate(BaseModel):
 class CustomerStageUpdate(BaseModel):
     """推进商机阶段 · 一键点选"""
     stage: Literal[
-        "added", "measured", "proposal", "quoted",
+        "added", "discovery", "proposal", "quoted",
         "negotiating", "won", "lost",
     ]
 

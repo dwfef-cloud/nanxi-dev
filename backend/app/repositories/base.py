@@ -92,11 +92,25 @@ class Repository(ABC):
         ...
 
     @abstractmethod
+    def delete_script(self, script_id: str) -> None:
+        """删除话术（连带删除其全部变体）。话术不存在时抛 KeyError。
+
+        注意：script_usage（历史归因）与 comment_tasks.reply_script_id 不清理，
+        历史记录保持可追溯。
+        """
+        ...
+
+    @abstractmethod
     def list_variants(self, script_id: str) -> list[ScriptVariant]:
         ...
 
     @abstractmethod
     def save_variant(self, variant: ScriptVariant) -> ScriptVariant:
+        ...
+
+    @abstractmethod
+    def delete_variant(self, script_id: str, variant_id: str) -> None:
+        """删除某个变体（按 variant_id，即 A/B/C）。不存在时抛 KeyError。"""
         ...
 
     @abstractmethod
@@ -117,6 +131,10 @@ class Repository(ABC):
 
     @abstractmethod
     def save_comment_task(self, task: CommentReplyTask) -> CommentReplyTask:
+        ...
+
+    @abstractmethod
+    def delete_comment_task(self, task_id: str) -> None:
         ...
 
     # ═══════════════════════════════════════════════════════
@@ -260,23 +278,48 @@ class Repository(ABC):
         ...
 
     # ═══════════════════════════════════════════════════════
-    # 配置域 · 单例
+    # 配置域 · 画像表（多条记录 + 主记录 is_primary）
+    #   get_xxx() 取主记录；list_xxx() 取全部（主记录在最前）
     # ═══════════════════════════════════════════════════════
 
     @abstractmethod
     def get_business_profile(self) -> BusinessProfile: ...
     @abstractmethod
+    def list_business_profiles(self) -> list[BusinessProfile]: ...
+    @abstractmethod
+    def get_business_profile_by_id(self, record_id: str) -> BusinessProfile | None: ...
+    @abstractmethod
     def save_business_profile(self, profile: BusinessProfile) -> BusinessProfile: ...
+    @abstractmethod
+    def delete_business_profile(self, record_id: str) -> None: ...
+    @abstractmethod
+    def set_primary_business_profile(self, record_id: str) -> None: ...
 
     @abstractmethod
     def get_product_knowledge(self) -> ProductKnowledge: ...
     @abstractmethod
+    def list_product_knowledge(self) -> list[ProductKnowledge]: ...
+    @abstractmethod
+    def get_product_knowledge_by_id(self, record_id: str) -> ProductKnowledge | None: ...
+    @abstractmethod
     def save_product_knowledge(self, value: ProductKnowledge) -> ProductKnowledge: ...
+    @abstractmethod
+    def delete_product_knowledge(self, record_id: str) -> None: ...
+    @abstractmethod
+    def set_primary_product_knowledge(self, record_id: str) -> None: ...
 
     @abstractmethod
     def get_audience_profile(self) -> AudienceProfile: ...
     @abstractmethod
+    def list_audience_profiles(self) -> list[AudienceProfile]: ...
+    @abstractmethod
+    def get_audience_profile_by_id(self, record_id: str) -> AudienceProfile | None: ...
+    @abstractmethod
     def save_audience_profile(self, value: AudienceProfile) -> AudienceProfile: ...
+    @abstractmethod
+    def delete_audience_profile(self, record_id: str) -> None: ...
+    @abstractmethod
+    def set_primary_audience_profile(self, record_id: str) -> None: ...
 
     @abstractmethod
     def get_script_strategy(self) -> ScriptStrategy: ...
@@ -286,7 +329,15 @@ class Repository(ABC):
     @abstractmethod
     def get_wechat_settings(self) -> WeChatSettings: ...
     @abstractmethod
+    def list_wechat_settings(self) -> list[WeChatSettings]: ...
+    @abstractmethod
+    def get_wechat_settings_by_id(self, record_id: str) -> WeChatSettings | None: ...
+    @abstractmethod
     def save_wechat_settings(self, value: WeChatSettings) -> WeChatSettings: ...
+    @abstractmethod
+    def delete_wechat_settings(self, record_id: str) -> None: ...
+    @abstractmethod
+    def set_primary_wechat_settings(self, record_id: str) -> None: ...
 
     # ═══════════════════════════════════════════════════════
     # 系统配置中心 · key-value
@@ -399,6 +450,9 @@ class Repository(ABC):
 
     def list_script_usages(self, lead_id: str | None = None) -> list[ScriptUsage]:
         return []
+
+    def variant_usage_stats(self) -> dict[tuple[str, str], dict[str, int]]:
+        return {}
 
     # ═══════════════════════════════════════════════════════════
     # 账号操作审计域 · AccountEvent（埋点补全 Task5）

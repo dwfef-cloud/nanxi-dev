@@ -123,3 +123,15 @@ def import_crawl_results(
     if not payload.items:
         raise HTTPException(status_code=400, detail="items 不能为空")
     return service.import_comments(payload)
+
+
+@router.post("/backfill-video-titles")
+def backfill_video_titles(
+    service: CrawlService = Depends(get_crawl_service),
+) -> dict:
+    """补齐存量数据的视频名称。
+
+    评论采集文件里没有视频标题，标题在 MediaCrawler 的内容文件里。
+    早期入库的线索因此「视频名称」一栏全空，调一次即可按 aweme_id 回填。
+    """
+    return service.backfill_video_titles()

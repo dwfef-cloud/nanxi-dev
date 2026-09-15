@@ -20,6 +20,11 @@ _MIGRATIONS: list[str] = [
     "app.db.migrations.v005_sub_comment_reply_detect",
     "app.db.migrations.v006_reply_detail",
     "app.db.migrations.v007_reply_tree",
+    "app.db.migrations.v008_account_profile",
+    "app.db.migrations.v009_comment_task_detail",
+    "app.db.migrations.v010_scripts_source",
+    "app.db.migrations.v011_profile_records",
+    "app.db.migrations.v012_script_material_fields",
 ]
 
 

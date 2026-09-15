@@ -155,7 +155,6 @@
     audit: [
       { time: '08-25 09:12', type: 'safe_mode', level: 'danger', text: '账号「同城装修·班长」health_score=38，联动触发安全模式，全量暂停' },
       { time: '08-25 08:40', type: 'r1_hit', level: 'warn', text: 'R1 命中：账号「全屋定制·凯文」日频达 80，降速至 40/天' },
-      { time: '08-24 21:03', type: 'r2_switch', level: 'warn', text: 'R2 命中：装修主话术变体B 转化率 5.9%（样本 51），自动切换至变体A' },
       { time: '08-24 18:31', type: 'unsubscribe', level: 'info', text: '用户 @选择困难症小姐 退订，已加入黑名单，不再触达' },
       { time: '08-24 15:02', type: 'dm_reply', level: 'info', text: '线索「旧房翻新求推荐」回复私信，进入加微引导' },
       { time: '08-23 22:10', type: 'ban', level: 'danger', text: '账号「同城装修·班长」平台限流 6 小时，记 account_limited，健康分 -18' },
@@ -200,19 +199,20 @@
   ];
 
   /* ════════ 客户与商机 ════════ */
+  // 通用成交流程（不绑定行业）：原「已量房」为装修专属，已替换为「需求沟通」
   const STAGE_META = {
-    added:       { label: '已加微',   cls: 'wechat',   order: 1 },
-    measured:    { label: '已量房',   cls: 'sent',     order: 2 },
-    proposal:    { label: '方案中',   cls: 'pending',  order: 3 },
-    quoted:      { label: '已报价',   cls: 'throttled',order: 4 },
-    negotiating: { label: '谈判中',   cls: 'mid',      order: 5 },
-    won:         { label: '已成交',   cls: 'deal',     order: 6 },
-    lost:        { label: '已流失',   cls: 'rejected', order: 7 },
+    added:       { label: '已加微',   cls: 'wechat',    order: 1, desc: '已建立联系（加微成功），等待首次沟通' },
+    discovery:   { label: '需求沟通', cls: 'sent',      order: 2, desc: '已沟通清楚客户的需求、预算与关键信息' },
+    proposal:    { label: '方案中',   cls: 'pending',   order: 3, desc: '正在准备方案 / 给建议（实物商品类可跳过）' },
+    quoted:      { label: '已报价',   cls: 'throttled', order: 4, desc: '方案或价格已发出，等待客户反馈' },
+    negotiating: { label: '谈判中',   cls: 'mid',       order: 5, desc: '正在沟通条款 / 优惠，推进签约' },
+    won:         { label: '已成交',   cls: 'deal',      order: 6, desc: '已付款成交' },
+    lost:        { label: '已流失',   cls: 'rejected',  order: 7, desc: '确认不做了 / 已选竞品，沉淀流失原因' },
   };
 
   let customers = [
-    { id: 'CU-001', leadId: 'LD-1016', name: '叮当一家', hue: 260, source: 'own_comment', stage: 'won', estValue: 128000, dealAmount: 128000, dealAt: '08-25 10:30', wechatAddedAt: '08-24 09:12', nextAction: null, nextAt: null, logs: [{ time: '08-23 21:05', text: '私信引导加微（变体A）', by: '系统' }, { time: '08-24 09:12', text: '已加企微，自动发送欢迎语 + 案例合集', by: '系统' }, { time: '08-24 14:20', text: '电话沟通需求：120平三室两厅，全包预算 12-13 万', by: '老板' }, { time: '08-24 16:00', text: '预约周末量房', by: '老板' }, { time: '08-25 10:30', text: '签约成交 ¥128,000，8月28日开工', by: '老板' }] },
-    { id: 'CU-002', leadId: 'LD-1021', name: '客厅改造预算8w', hue: 348, source: 'own_comment', stage: 'measured', estValue: 80000, wechatAddedAt: '08-25 09:44', nextAction: '发送量房后的方案与报价', nextAt: '今天 16:00', logs: [{ time: '08-24 22:40', text: '私信触达（变体A），用户回复要看案例', by: '系统' }, { time: '08-25 09:44', text: '已加企微（自动回调）', by: '系统' }, { time: '08-25 11:00', text: '上午量房完成：79㎡，拆改需求确认', by: '老板' }] },
+    { id: 'CU-001', leadId: 'LD-1016', name: '叮当一家', hue: 260, source: 'own_comment', stage: 'won', estValue: 128000, dealAmount: 128000, dealAt: '08-25 10:30', wechatAddedAt: '08-24 09:12', nextAction: null, nextAt: null, logs: [{ time: '08-23 21:05', text: '私信引导加微（变体A）', by: '系统' }, { time: '08-24 09:12', text: '已加企微，自动发送欢迎语 + 案例合集', by: '系统' }, { time: '08-24 14:20', text: '电话沟通需求：120平三室两厅，全包预算 12-13 万', by: '老板' }, { time: '08-24 16:00', text: '预约周末上门沟通', by: '老板' }, { time: '08-25 10:30', text: '签约成交 ¥128,000，8月28日开工', by: '老板' }] },
+    { id: 'CU-002', leadId: 'LD-1021', name: '客厅改造预算8w', hue: 348, source: 'own_comment', stage: 'discovery', estValue: 80000, wechatAddedAt: '08-25 09:44', nextAction: '发送方案与报价', nextAt: '今天 16:00', logs: [{ time: '08-24 22:40', text: '私信触达（变体A），用户回复要看案例', by: '系统' }, { time: '08-25 09:44', text: '已加企微（自动回调）', by: '系统' }, { time: '08-25 11:00', text: '需求沟通完成：面积 79㎡，拆改需求确认', by: '老板' }] },
     { id: 'CU-003', leadId: 'LD-1013', name: 'Lynn的宅家计划', hue: 300, source: 'own_comment', stage: 'quoted', estValue: 150000, wechatAddedAt: '08-23 19:44', nextAction: '报价反馈回访', nextAt: '明天 10:00', logs: [{ time: '08-23 19:44', text: '已加企微，发送日式原木风案例合集', by: '系统' }, { time: '08-24 10:30', text: '出方案：100㎡ 全案 ¥148,000（含主材）', by: '老板' }, { time: '08-24 10:35', text: '报价单已发送，等待反馈', by: '老板' }] },
     { id: 'CU-004', leadId: 'LD-1015', name: '北岸小业主', hue: 96, source: 'own_comment', stage: 'added', estValue: 110000, wechatAddedAt: '08-24 11:20', manual: true, nextAction: 'SOP·D1：发送同预算案例（自动生成）', nextAt: '今天 12:00', logs: [{ time: '08-24 11:20', text: '已加企微（手动标记，到店看样板间意向）', by: '系统' }, { time: '08-24 11:25', text: '发送样板间定位 + 预约通道', by: '系统' }] },
     { id: 'CU-005', leadId: 'LD-1009', name: '风起云涌', hue: 80, source: 'own_comment', stage: 'proposal', estValue: 160000, wechatAddedAt: '08-23 10:10', nextAction: '电话讲解 15 万旧改方案', nextAt: '明天 10:00', logs: [{ time: '08-23 10:10', text: '已加企微，发送同小区改造前后对比', by: '系统' }, { time: '08-24 09:40', text: '老城区 96㎡ 旧改方案设计中', by: '老板' }] },
@@ -225,7 +225,7 @@
   /* ════════ 今日跟进 ════════ */
   let followups = [
     { id: 'FU-01', cuId: 'CU-007', customerName: '翡翠湾陈先生', type: '报价跟进', text: '发送报价二版（按 96㎡ 调整主材）', due: '今天 15:00', overdue: false, done: false },
-    { id: 'FU-02', cuId: 'CU-002', customerName: '客厅改造预算8w', type: '方案推进', text: '量房后方案 + 报价发送', due: '今天 16:00', overdue: false, done: false },
+    { id: 'FU-02', cuId: 'CU-002', customerName: '客厅改造预算8w', type: '方案推进', text: '需求确认后方案 + 报价发送', due: '今天 16:00', overdue: false, done: false },
     { id: 'FU-03', cuId: 'CU-006', customerName: '张姐的复式楼', type: '谈判', text: '合同条款确认（工期/付款节点）', due: '今天 18:00', overdue: false, done: false },
     { id: 'FU-04', cuId: 'CU-004', customerName: '北岸小业主', type: 'SOP·D1', text: '发送同预算案例（培育 SOP 自动生成）', due: '今天 12:00', overdue: true, done: false },
     { id: 'FU-05', cuId: 'CU-008', customerName: '张先生·老城公寓', type: 'SOP·D1', text: '欢迎语后首条价值内容', due: '今天 14:00', overdue: true, done: false },
@@ -284,7 +284,7 @@
       intro: '评论区高意向用户首次私信，价值钩子 = 同预算真实案例 + 明细报价',
       variants: [
         { id: 'A', text: '您好！看到您在「{视频标题}」下留言～{预算/面积}这个区间我们刚好有一套刚交付的真实案例（含全部主材明细）。评论区放不了文件，发您一份落地实拍+报价单？', weight: 70, status: 'active', sent: 214, replied: 79, wechatAdded: 24, convRate: 11.2, sampleEnough: true },
-        { id: 'B', text: '您好！您留言的{需求关键词}我们本月做了 3 户同小区的工地～加我企微发您工地实拍直播和报价区间，还能预约到店量房：[企业微信名片]', weight: 30, status: 'switched_off', sent: 51, replied: 9, wechatAdded: 3, convRate: 5.9, sampleEnough: true, r2Note: 'R2 命中（08-24）：转化率 5.9% < 8%，样本 51 ≥ 30，已自动停用，权重转移至变体A' },
+        { id: 'B', text: '您好！您留言的{需求关键词}我们本月做了 3 户同小区的工地～加我企微发您工地实拍直播和报价区间，还能预约到店量房：[企业微信名片]', weight: 30, status: 'switched_off', sent: 0, replied: 0, wechatAdded: 0, convRate: null, sampleEnough: false },
         { id: 'C', text: '（编辑中草稿）您好，看到您的留言，我们专注本地装修 12 年…', weight: 0, status: 'draft', sent: 0, replied: 0, wechatAdded: 0, convRate: null, sampleEnough: false },
       ],
       welcomeMsg: '欢迎～我是 {顾问名}，您的专属装修顾问。这边先发您三样东西：①同预算案例合集 ②报价明细表 ③工地直播入口，有任何问题随时问我。',
